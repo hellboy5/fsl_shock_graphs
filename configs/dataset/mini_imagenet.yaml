@@ -1,0 +1,18 @@
+# configs/dataset/mini_imagenet.yaml
+name: "mini_imagenet"
+data_root: "/path/to/your/dataset"      # Update this to your actual path
+num_classes: 100
+
+# Image Normalization (Standard ImageNet)
+vision:
+  image_size: 84
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+# Graph Normalization 
+# (Based on the outputs of your compute_graph_stats.py script)
+graph:
+  node_mean: [0.0, 0.0, 0.0]  
+  node_std:  [1.0, 1.0, 1.0]
+  edge_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  edge_std:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
