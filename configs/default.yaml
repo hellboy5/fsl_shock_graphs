@@ -1,6 +1,11 @@
 defaults:
   - dataset: mini_imagenet
 
+
+mode: "train"               # 'train' or 'eval'
+seed: 42
+checkpoint_path: "none"     # Update this when running eval
+
 training:
   epochs: 100
   lr: 0.1
