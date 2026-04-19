@@ -1,0 +1,17 @@
+# Python environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Data and Checkpoints (CRITICAL)
+data/mini_imagenet/
+data/**/*.pth
+experiments/
+*.pth
+*.pt
+
+# OS and IDEs
+.DS_Store
+.vscode/
+.idea/
