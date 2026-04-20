@@ -15,15 +15,15 @@ class DropBlock(nn.Module):
         if self.training:
             batch_size, channels, height, width = x.shape
             bernoulli = Bernoulli(gamma)
-            mask = bernoulli.sample((batch_size, channels, height - (self.block_size - 1), width - (self.block_size - 1))).cuda()
-            block_mask = self._compute_block_mask(mask)
+            mask = bernoulli.sample((batch_size, channels, height - (self.block_size - 1), width - (self.block_size - 1))).to(x.device)
+            block_mask = self._compute_block_mask(mask,x.device)
             countM = block_mask.size()[0] * block_mask.size()[1] * block_mask.size()[2] * block_mask.size()[3]
             count_ones = block_mask.sum()
             return block_mask * x * (countM / count_ones)
         else:
             return x
 
-    def _compute_block_mask(self, mask):
+    def _compute_block_mask(self, mask, device):
         left_padding = int((self.block_size-1) / 2)
         right_padding = int(self.block_size / 2)
         batch_size, channels, height, width = mask.shape
@@ -35,8 +35,9 @@ class DropBlock(nn.Module):
                 torch.arange(self.block_size).view(-1, 1).expand(self.block_size, self.block_size).reshape(-1),
                 torch.arange(self.block_size).repeat(self.block_size),
             ]
-        ).t().cuda()
-        offsets = torch.cat((torch.zeros(self.block_size**2, 2).cuda().long(), offsets.long()), 1)
+        ).t().to(device)
+        zeros_tensor = torch.zeros(self.block_size**2, 2, dtype=torch.long, device=device)
+        offsets = torch.cat((zeros_tensor, offsets.long()), 1)
 
         if nr_blocks > 0:
             non_zero_idxs = non_zero_idxs.repeat(self.block_size ** 2, 1)
