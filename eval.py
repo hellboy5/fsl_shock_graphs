@@ -16,7 +16,6 @@ def compute_confidence_interval(data):
 def run_evaluation(cfg, device):
     # Extract evaluation parameters from the runtime config
     checkpoint_path = cfg.checkpoint_path
-    data_dir = cfg.dataset.data_root
     eval_n_way = cfg.task.n_way
     eval_n_shot = cfg.task.n_shot
     eval_n_query = cfg.task.n_query
@@ -32,7 +31,9 @@ def run_evaluation(cfg, device):
     print(f"Evaluating on {eval_n_way}-Way {eval_n_shot}-Shot ({eval_episodes} episodes)")
 
     # 2. Setup Test Data (Using the NEW evaluation parameters)
-    test_set = MultimodalFSLDataset(data_dir, split='test', 
+    test_set = MultimodalFSLDataset(cfg.dataset,
+                                    modality=train_cfg.model.modality,
+                                    split='test', 
                                     vision_transform=get_vision_transform('test'), 
                                     graph_transform=get_graph_transform(train_cfg))
     
@@ -44,14 +45,16 @@ def run_evaluation(cfg, device):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    targets = torch.arange(eval_n_way).repeat(eval_n_query).long().to(device)
+    targets = torch.arange(eval_n_way).repeat_interleave(eval_n_query).long().to(device)
     test_accs = []
 
     # 4. Evaluation Loop
     with torch.no_grad():
         for batch in test_loader:
-            # We pass the NEW runtime n_way and k_shot so the FSL Engine splits the tensor correctly
-            logits = model(batch['image'].to(device), batch['graph'].to(device), eval_n_way, eval_n_shot)
+            img_batch = batch['image'].to(device) if batch['image'] is not None else None
+            graph_batch = batch['graph'].to(device)
+            
+            logits = model(img_batch, graph_batch, eval_n_way, eval_n_shot)
             acc = calculate_accuracy(logits, targets)
             test_accs.append(acc)
 

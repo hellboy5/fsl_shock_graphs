@@ -1,90 +1,94 @@
-# data/dataset.py
 import os
 import glob
-import random
 import torch
-from torch_geometric.data import Dataset
+from torch_geometric.data import Dataset, Data
 from PIL import Image
-from torchvision import transforms
-from .transforms import NormalizeGraphContinuous
 
 class MultimodalFSLDataset(Dataset):
-    def __init__(self, cfg, split='train', transform=None, pre_transform=None):
-        super().__init__(root=cfg.data_root, transform=transform, pre_transform=pre_transform)
+    """
+    Multimodal Few-Shot Learning Dataset.
+    Integrates PyTorch Geometric graph data with standard torchvision images.
+    """
+    def __init__(self, cfg, modality: str, split='train', vision_transform=None, graph_transform=None):
+        # Pass None to PyG's superclass so we can manually handle our custom transforms
+        super().__init__(root=None, transform=None, pre_transform=None)
+        
         self.cfg = cfg
         self.split = split
-        self.modality = cfg.modality
+        self.modality = modality
         self.split_dir = os.path.join(cfg.data_root, split)
         
-        # Image Transform
-        self.image_transform = transforms.Compose([
-            transforms.Resize((cfg.image_size, cfg.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=cfg.normalize_img.mean, std=cfg.normalize_img.std)
-        ])
+        # Map the injected transforms directly
+        self.vision_transform = vision_transform
+        self.graph_transform = graph_transform
 
-        # PyG Graph Transform
-        self.graph_transform = NormalizeGraphContinuous(
-            node_mean=cfg.normalize_graph.node_mean,
-            node_std=cfg.normalize_graph.node_std,
-            edge_mean=cfg.normalize_graph.edge_mean,
-            edge_std=cfg.normalize_graph.edge_std
-        )
-
+        # Load file paths and build the dataset index
         self.samples = self._load_and_group_files()
+        
+        # Expose a flat list of labels for the EpisodicBatchSampler to use!
+        self.labels = [sample['class_idx'] for sample in self.samples]
 
     def _load_and_group_files(self):
+        """
+        Scans the directory structure to pair images with their corresponding graph files.
+        Assumes each sample has exactly one .pth file and one .jpg file.
+        """
         samples = []
         class_folders = sorted([d for d in os.listdir(self.split_dir) 
                                 if os.path.isdir(os.path.join(self.split_dir, d))])
         
         for class_idx, class_name in enumerate(class_folders):
             class_path = os.path.join(self.split_dir, class_name)
+            
+            # Find all .pth files in the class folder
             pth_files = glob.glob(os.path.join(class_path, "*.pth"))
             
-            grouped_files = {}
             for pth_path in pth_files:
                 filename = os.path.basename(pth_path)
-                base_name = filename.split('_aug')[0].split('_eval')[0]
                 
-                if base_name not in grouped_files:
-                    grouped_files[base_name] = []
-                grouped_files[base_name].append(pth_path)
+                # Strip the extension and any tags to get the pure base name
+                # e.g., 'dog_001_aug.pth' -> 'dog_001'
+                base_name = filename.split('.pth')[0].split('_aug')[0].split('_eval')[0]
                 
-            for base_name, file_list in grouped_files.items():
+                # Construct the image path
+                image_path = os.path.join(class_path, f"{base_name}.jpg")
+                
                 samples.append({
-                    'file_group': file_list,
                     'class_idx': class_idx,
-                    'class_name': class_name
+                    'class_name': class_name,
+                    'graph_path': pth_path,  # One single graph file per sample!
+                    'image_path': image_path
                 })
+                
         return samples
-
+    
     def len(self):
         return len(self.samples)
 
     def get(self, idx):
-        sample_info = self.samples[idx]
+        sample = self.samples[idx]
         
-        if self.split == 'train':
-            pth_path = random.choice(sample_info['file_group'])
-        else:
-            eval_files = [f for f in sample_info['file_group'] if '_eval' in f]
-            if not eval_files:
-                raise FileNotFoundError(f"Missing _eval file for {sample_info['class_name']}")
-            pth_path = eval_files[0]
+        # --- A. Load Graph Data ---
+        # Load the pre-packaged PyG Data object directly from the single file
+        data = torch.load(sample['graph_path'], weights_only=False)
         
-        # 1. Load and transform graph
-        data = torch.load(pth_path)
-        data.y = torch.tensor([sample_info['class_idx']], dtype=torch.long)
-        data = self.graph_transform(data)
+        # Explicitly set/override the dataset label for your Few-Shot Sampler
+        data.y = torch.tensor([sample['class_idx']], dtype=torch.long)
         
-        # 2. Load multimodal image if required
-        if self.modality == 'multimodal':
-            img_path = pth_path.replace('.pth', '.jpg')
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"Missing image for graph: {pth_path}")
-                
-            image = Image.open(img_path).convert('RGB')
-            data.x_img = self.image_transform(image)
+        # Apply graph transform if provided
+        if self.graph_transform is not None:
+            data = self.graph_transform(data)
             
+        # --- B. Load Vision Data ---
+        if self.modality in ['multimodal', 'vision']:
+            if not os.path.exists(sample['image_path']):
+                raise FileNotFoundError(f"Image not found at {sample['image_path']}")
+                
+            image = Image.open(sample['image_path']).convert('RGB')
+            
+            if self.vision_transform is not None:
+                data.x_img = self.vision_transform(image)
+            else:
+                raise ValueError("vision_transform cannot be None if modality includes vision.")
+                
         return data
