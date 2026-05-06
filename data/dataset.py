@@ -31,7 +31,7 @@ class MultimodalFSLDataset(Dataset):
     def _load_and_group_files(self):
         """
         Scans the directory structure to pair images with their corresponding graph files.
-        Assumes each sample has exactly one .pth file and one .jpg file.
+        Enforces a strict 1-to-1 mapping based on the offline augmentation strategy.
         """
         samples = []
         class_folders = sorted([d for d in os.listdir(self.split_dir) 
@@ -40,24 +40,18 @@ class MultimodalFSLDataset(Dataset):
         for class_idx, class_name in enumerate(class_folders):
             class_path = os.path.join(self.split_dir, class_name)
             
-            # Find all .pth files in the class folder
-            pth_files = glob.glob(os.path.join(class_path, "*.pth"))
+            # 1. Find all .pt graph files (e.g., dog_001_aug_00.pt)
+            pt_files = glob.glob(os.path.join(class_path, "*.pt"))
             
-            for pth_path in pth_files:
-                filename = os.path.basename(pth_path)
-                
-                # Strip the extension and any tags to get the pure base name
-                # e.g., 'dog_001_aug.pth' -> 'dog_001'
-                base_name = filename.split('.pth')[0].split('_aug')[0].split('_eval')[0]
-                
-                # Construct the image path
-                image_path = os.path.join(class_path, f"{base_name}.jpg")
+            for pt_path in pt_files:
+                # 2. Swap the extension to find the exact matching augmented image
+                image_path = pt_path.replace('.pt', '.jpg')
                 
                 samples.append({
                     'class_idx': class_idx,
                     'class_name': class_name,
-                    'graph_path': pth_path,  # One single graph file per sample!
-                    'image_path': image_path
+                    'graph_path': pt_path,   # The .pt file
+                    'image_path': image_path # The perfectly aligned .jpg file
                 })
                 
         return samples
