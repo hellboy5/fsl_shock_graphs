@@ -17,7 +17,8 @@ def list_files(filepath, filetype):
     paths = []
     for root, dirs, files in os.walk(filepath):
         for file in files:
-            if file.endswith(filetype):
+            # ONLY grab raw images, skip anything already augmented
+            if file.endswith(filetype) and '_aug_' not in file:
                 paths.append(os.path.join(root, file))
     return paths
 

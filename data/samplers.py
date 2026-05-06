@@ -1,26 +1,31 @@
 import numpy as np
+from collections import defaultdict
 from torch.utils.data import Sampler
 
 class EpisodicBatchSampler(Sampler):
     """
-    Yields batches of indices corresponding to Few-Shot Learning episodes.
-    Ensures that the output batch is strictly ordered: 
-    All Support images (grouped by class), followed by All Query images (grouped by class).
+    Yields batches of indices for Few-Shot Learning episodes.
+    Strictly guarantees that no two augmentations of the same base image 
+    appear in the same episode, preventing data leakage.
     """
-    def __init__(self, labels, n_way, k_shot, q_query, episodes_per_epoch):
+    def __init__(self, labels, base_names, n_way, k_shot, q_query, episodes_per_epoch):
         super().__init__(None)
-        self.labels = np.array(labels)
         self.n_way = n_way
         self.k_shot = k_shot
         self.q_query = q_query
         self.episodes_per_epoch = episodes_per_epoch
 
-        # Identify all unique classes in the dataset
-        self.classes = np.unique(self.labels)
+        self.classes = np.unique(labels)
         
-        # Map each class to a list of its corresponding data indices
-        self.class_to_indices = {
-            c: np.where(self.labels == c)[0] for c in self.classes
+        # Build a nested dictionary: { class_idx: { base_name: [list_of_dataset_indices] } }
+        self.class_to_base_to_indices = {c: defaultdict(list) for c in self.classes}
+        
+        for idx, (label, base_name) in enumerate(zip(labels, base_names)):
+            self.class_to_base_to_indices[label][base_name].append(idx)
+            
+        # Keep a fast-lookup list of unique base names per class
+        self.class_to_base_names = {
+            c: list(self.class_to_base_to_indices[c].keys()) for c in self.classes
         }
 
     def __iter__(self):
@@ -28,29 +33,31 @@ class EpisodicBatchSampler(Sampler):
             support_indices = []
             query_indices = []
             
-            # 1. Randomly sample 'n_way' classes for this episode
+            # 1. Randomly sample classes for this episode
             selected_classes = np.random.choice(self.classes, self.n_way, replace=False)
             
             for c in selected_classes:
-                class_indices = self.class_to_indices[c]
+                base_names_for_class = self.class_to_base_names[c]
                 samples_needed = self.k_shot + self.q_query
                 
-                # Safety check: Ensure the class has enough data
-                if len(class_indices) < samples_needed:
-                    raise ValueError(f"Class {c} only has {len(class_indices)} samples, but {samples_needed} are needed.")
+                if len(base_names_for_class) < samples_needed:
+                    raise ValueError(f"Class {c} only has {len(base_names_for_class)} unique images, need {samples_needed}.")
                 
-                # 2. Randomly select the required number of images for this class
-                selected_indices = np.random.choice(class_indices, samples_needed, replace=False)
+                # 2. Randomly select unique BASE images (preventing leakage)
+                selected_bases = np.random.choice(base_names_for_class, samples_needed, replace=False)
                 
-                # 3. CRITICAL FIX: Split indices into Support and Query BEFORE aggregating
-                support_indices.extend(selected_indices[:self.k_shot].tolist())
-                query_indices.extend(selected_indices[self.k_shot:].tolist())
+                selected_indices = []
+                # 3. For each chosen base image, randomly pick EXACTLY ONE augmentation index
+                for base in selected_bases:
+                    aug_indices = self.class_to_base_to_indices[c][base]
+                    chosen_aug_idx = np.random.choice(aug_indices)
+                    selected_indices.append(chosen_aug_idx)
                 
-            # 4. Combine so the model can safely slice the first (n_way * k_shot) elements
-            episode_indices = support_indices + query_indices
-            
-            # Yield the final list of indices to the DataLoader
-            yield episode_indices
+                # 4. Split into Support and Query
+                support_indices.extend(selected_indices[:self.k_shot])
+                query_indices.extend(selected_indices[self.k_shot:])
+                
+            yield support_indices + query_indices
 
     def __len__(self):
         return self.episodes_per_epoch

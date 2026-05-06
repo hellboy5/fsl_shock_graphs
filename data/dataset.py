@@ -8,6 +8,7 @@ class MultimodalFSLDataset(Dataset):
     """
     Multimodal Few-Shot Learning Dataset.
     Integrates PyTorch Geometric graph data with standard torchvision images.
+    Expects offline pre-computed spatial augmentations for perfect graph alignment.
     """
     def __init__(self, cfg, modality: str, split='train', vision_transform=None, graph_transform=None):
         # Pass None to PyG's superclass so we can manually handle our custom transforms
@@ -25,8 +26,9 @@ class MultimodalFSLDataset(Dataset):
         # Load file paths and build the dataset index
         self.samples = self._load_and_group_files()
         
-        # Expose a flat list of labels for the EpisodicBatchSampler to use!
+        # Expose flat lists for the EpisodicBatchSampler to prevent data leakage
         self.labels = [sample['class_idx'] for sample in self.samples]
+        self.base_names = [sample['base_name'] for sample in self.samples]
 
     def _load_and_group_files(self):
         """
@@ -40,16 +42,21 @@ class MultimodalFSLDataset(Dataset):
         for class_idx, class_name in enumerate(class_folders):
             class_path = os.path.join(self.split_dir, class_name)
             
-            # 1. Find all .pt graph files (e.g., dog_001_aug_00.pt)
+            # 1. Find all .pt graph files (e.g., dog_001_aug_00.pt to dog_001_aug_09.pt)
             pt_files = glob.glob(os.path.join(class_path, "*.pt"))
             
             for pt_path in pt_files:
                 # 2. Swap the extension to find the exact matching augmented image
                 image_path = pt_path.replace('.pt', '.jpg')
                 
+                # 3. Extract the base name (e.g., 'dog_001' from 'dog_001_aug_05.pt')
+                filename = os.path.basename(pt_path)
+                base_name = filename.split('_aug_')[0]
+                
                 samples.append({
                     'class_idx': class_idx,
                     'class_name': class_name,
+                    'base_name': base_name,
                     'graph_path': pt_path,   # The .pt file
                     'image_path': image_path # The perfectly aligned .jpg file
                 })
@@ -69,17 +76,21 @@ class MultimodalFSLDataset(Dataset):
         # Explicitly set/override the dataset label for your Few-Shot Sampler
         data.y = torch.tensor([sample['class_idx']], dtype=torch.long)
         
-        # Apply graph transform if provided
+        # Apply dynamic in-memory graph transform (e.g., DropEdge) if provided
         if self.graph_transform is not None:
             data = self.graph_transform(data)
             
         # --- B. Load Vision Data ---
         if self.modality in ['multimodal', 'vision']:
             if not os.path.exists(sample['image_path']):
-                raise FileNotFoundError(f"Image not found at {sample['image_path']}")
+                raise FileNotFoundError(f"Image not found at {sample['image_path']}. "
+                                        f"Check if the augmentation script generated it.")
                 
             image = Image.open(sample['image_path']).convert('RGB')
             
+            # Apply vision transform 
+            # Note: Because spatial crops were done offline, this should ONLY contain 
+            # transforms.ToTensor() and transforms.Normalize()
             if self.vision_transform is not None:
                 data.x_img = self.vision_transform(image)
             else:
