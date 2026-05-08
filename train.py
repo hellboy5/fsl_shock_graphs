@@ -45,12 +45,21 @@ def run_training(cfg, device):
     os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
     
     # Setup Data
-    v_transform_train = get_vision_transform(split='train')
-    v_transform_val = get_vision_transform(split='val')
+    # Setup Data Transforms (Driven entirely by config)
+    v_transform = get_vision_transform(cfg)
     g_transform = get_graph_transform(cfg)
+        
+    train_set = MultimodalFSLDataset(cfg.dataset,
+                                     modality=cfg.model.modality,
+                                     split='train',
+                                     vision_transform=v_transform,
+                                     graph_transform=g_transform)
     
-    train_set = MultimodalFSLDataset(cfg.dataset, modality=cfg.model.modality, split='train', vision_transform=v_transform_train, graph_transform=g_transform)
-    val_set = MultimodalFSLDataset(cfg.dataset, modality=cfg.model.modality, split='val', vision_transform=v_transform_val, graph_transform=g_transform)
+    val_set = MultimodalFSLDataset(cfg.dataset,
+                                   modality=cfg.model.modality,
+                                   split='val',
+                                   vision_transform=v_transform,
+                                   graph_transform=g_transform)
 
     n_way, n_shot, n_query = cfg.task.n_way, cfg.task.n_shot, cfg.task.n_query
     

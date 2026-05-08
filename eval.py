@@ -29,12 +29,12 @@ def run_evaluation(cfg, device):
     
     print(f"Loaded checkpoint from Epoch {checkpoint['epoch']} (Original Val Acc: {checkpoint['best_val_acc']:.2f}%)")
     print(f"Evaluating on {eval_n_way}-Way {eval_n_shot}-Shot ({eval_episodes} episodes)")
-
+    
     # 2. Setup Test Data (Using the NEW evaluation parameters)
     test_set = MultimodalFSLDataset(cfg.dataset,
                                     modality=train_cfg.model.modality,
                                     split='test', 
-                                    vision_transform=get_vision_transform('test'), 
+                                    vision_transform=get_vision_transform(train_cfg), 
                                     graph_transform=get_graph_transform(train_cfg))
     
     test_sampler = EpisodicBatchSampler(test_set.labels, eval_n_way, eval_n_shot, eval_n_query, eval_episodes)
