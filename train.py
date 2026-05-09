@@ -62,9 +62,9 @@ def run_training(cfg, device):
                                    graph_transform=g_transform)
 
     n_way, n_shot, n_query = cfg.task.n_way, cfg.task.n_shot, cfg.task.n_query
-    
-    train_sampler = EpisodicBatchSampler(train_set.labels, n_way, n_shot, n_query, cfg.task.train_episodes)
-    val_sampler = EpisodicBatchSampler(val_set.labels, n_way, n_shot, n_query, cfg.task.val_episodes)
+
+    train_sampler = EpisodicBatchSampler(train_set.labels, train_set.base_names, n_way, n_shot, n_query, cfg.task.train_episodes)
+    val_sampler = EpisodicBatchSampler(val_set.labels, val_set.base_names, n_way, n_shot, n_query, cfg.task.val_episodes)
 
     train_loader = DataLoader(train_set, batch_sampler=train_sampler, collate_fn=collate_fn)
     val_loader = DataLoader(val_set, batch_sampler=val_sampler, collate_fn=collate_fn)
