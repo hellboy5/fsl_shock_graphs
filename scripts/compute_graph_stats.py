@@ -2,6 +2,7 @@
 scripts/compute_graph_stats.py
 Computes dataset-wide normalization parameters for Shock Graphs,
 inspects feature distributions, and prints the config YAML block.
+Supports toggling between coarsened (*_coarse.pt) and uncoarsened (*.pt) files.
 """
 
 import argparse
@@ -65,19 +66,42 @@ def main():
     parser.add_argument("--data_root", type=str, required=True, help="Path to dataset root folder")
     parser.add_argument("--split", type=str, default="train", help="Dataset subfolder to scan (e.g. 'train')")
     parser.add_argument("--image_size", type=float, default=84.0, help="Image canvas resolution")
+    parser.add_argument(
+        "--use_coarse",
+        action="store_true",
+        help="If set, only process files ending with '_coarse.pt'. If not set, only process uncoarsened '*.pt' files.",
+    )
     args = parser.parse_args()
 
     target_dir = os.path.join(args.data_root, args.split)
-    pt_files = sorted(glob.glob(os.path.join(target_dir, "**", "*.pt"), recursive=True))
+    all_candidate_files = sorted(glob.glob(os.path.join(target_dir, "**", "*.pt"), recursive=True))
+
+    if not all_candidate_files:
+        raise FileNotFoundError(f"No .pt files found in {target_dir}")
+
+    # Disambiguate between coarse and uncoarsened files
+    if args.use_coarse:
+        pt_files = [f for f in all_candidate_files if f.endswith("_coarse.pt")]
+        file_mode_str = "COARSENED (*_coarse.pt)"
+    else:
+        pt_files = [f for f in all_candidate_files if not f.endswith("_coarse.pt")]
+        file_mode_str = "UNCOARSENED (*.pt, excluding *_coarse.pt)"
 
     if not pt_files:
-        raise FileNotFoundError(f"No .pt files found in {target_dir}")
+        raise FileNotFoundError(
+            f"No matching files found for mode {file_mode_str} under {target_dir}. "
+            f"Total .pt files scanned: {len(all_candidate_files)}"
+        )
 
     diag = math.sqrt(2.0) * args.image_size
     area = args.image_size * args.image_size
 
-    print(f"\nScanning {len(pt_files)} graph files from: {target_dir}")
-    print(f"Canvas: {args.image_size}x{args.image_size} | Diagonal: {diag:.2f} | Area: {area:.2f}\n")
+    print(f"\n==================================================")
+    print(f"Target Directory: {target_dir}")
+    print(f"Selection Mode  : {file_mode_str}")
+    print(f"Matching Graphs : {len(pt_files)} (out of {len(all_candidate_files)} total .pt files)")
+    print(f"Canvas Size     : {args.image_size}x{args.image_size} | Diagonal: {diag:.2f} | Area: {area:.2f}")
+    print(f"==================================================\n")
 
     all_raw_node_t = []
     all_log_node_t = []
@@ -113,7 +137,7 @@ def main():
             all_transformed_edges.append(e_trans)
 
     if len(all_raw_node_t) == 0:
-        raise ValueError("No valid nodes found across any .pt file.")
+        raise ValueError("No valid nodes found across any matching .pt file.")
 
     cat_raw_node_t = torch.cat(all_raw_node_t)
     cat_log_node_t = torch.cat(all_log_node_t)
@@ -125,7 +149,7 @@ def main():
 
     # ------------------ 1. Distribution Health-Check ------------------
     print("\n" + "=" * 90)
-    print("📊 FEATURE DISTRIBUTION HEALTH-CHECK (RAW vs. TRANSFORMED)")
+    print(f"📊 FEATURE DISTRIBUTION HEALTH-CHECK [{file_mode_str}]")
     print("=" * 90)
     print("Feature          |      Min |       1% |   Median |      99% |       Max |   Zeros | Flags")
     print("-" * 90)
@@ -158,7 +182,7 @@ def main():
 
     # ------------------ 3. Formatted YAML Output ------------------
     print("\n" + "=" * 50)
-    print("PASTE THIS INTO YOUR configs/dataset/mini_imagenet.yaml:")
+    print(f"PASTE THIS INTO YOUR configs/dataset/mini_imagenet.yaml ({file_mode_str}):")
     print("=" * 50)
     print("graph:")
     print(f"  image_size: {int(args.image_size)}")
