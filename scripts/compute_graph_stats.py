@@ -1,9 +1,9 @@
 """
 scripts/compute_graph_stats.py
 Computes dataset-wide normalization parameters for Shock Graphs using
-batched Welford's streaming accumulation algorithm (flat ~50MB RAM footprint).
-Enforces bilateral boundary symmetry (p == m), checks distributions via reservoir sampling,
-and prints the config YAML block.
+batched Welford's streaming accumulation (flat ~50MB RAM footprint).
+Uses absolute curvature magnitude (torch.abs), bilateral boundary pooling (p == m),
+reservoir sampling for distribution inspection, and outputs the YAML config block.
 """
 
 import argparse
@@ -16,14 +16,14 @@ from tqdm import tqdm
 
 EDGE_FEATURE_NAMES = [
     "s_length",      # 0 (Spine)
-    "s_curve",       # 1 (Spine)
-    "s_angle",       # 2 (Spine)
+    "s_curve",       # 1 (Spine - Absolute Curvature)
+    "s_angle",       # 2 (Spine - Angle Change)
     "p_length",      # 3 (Plus / Left Boundary)
-    "p_curve",       # 4 (Plus / Left Boundary)
-    "p_angle",       # 5 (Plus / Left Boundary)
+    "p_curve",       # 4 (Plus / Left Boundary - Absolute Curvature)
+    "p_angle",       # 5 (Plus / Left Boundary - Angle Change)
     "m_length",      # 6 (Minus / Right Boundary)
-    "m_curve",       # 7 (Minus / Right Boundary)
-    "m_angle",       # 8 (Minus / Right Boundary)
+    "m_curve",       # 7 (Minus / Right Boundary - Absolute Curvature)
+    "m_angle",       # 8 (Minus / Right Boundary - Angle Change)
     "poly_area",     # 9
     "avg_thickness", # 10
     "max_thickness", # 11
@@ -64,10 +64,6 @@ def print_distribution_summary(name, tensor):
 
 
 def update_welford_batch(existing_count, existing_mean, existing_m2, batch):
-    """
-    Chan et al. / Welford parallel algorithm to update running mean and M2
-    with an incoming 2D tensor batch [batch_size, dims].
-    """
     b_count = batch.size(0)
     if b_count == 0:
         return existing_count, existing_mean, existing_m2
@@ -87,7 +83,7 @@ def update_welford_batch(existing_count, existing_mean, existing_m2, batch):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Welford Streaming Graph Stats Computation")
+    parser = argparse.ArgumentParser(description="Welford Streaming Graph Stats with Absolute Curvature")
     parser.add_argument("--data_root", type=str, required=True, help="Path to dataset root folder")
     parser.add_argument("--split", type=str, default="train", help="Dataset subfolder to scan (e.g. 'train')")
     parser.add_argument("--image_size", type=float, default=84.0, help="Image canvas resolution")
@@ -100,7 +96,7 @@ def main():
         "--reservoir_size",
         type=int,
         default=50000,
-        help="Size of reservoir sample for percentile inspection (default: 50,000 edges)",
+        help="Size of reservoir sample for percentile inspection",
     )
     args = parser.parse_args()
 
@@ -129,26 +125,23 @@ def main():
     print(f"Matching Graphs : {len(pt_files)} (out of {len(all_candidate_files)} total .pt files)")
     print(f"Canvas Size     : {args.image_size}x{args.image_size} | Diagonal: {diag:.2f} | Area: {area:.2f}")
     print(f"Streaming Mode  : Welford Accumulator (< 50MB RAM)")
+    print(f"Curvature Mode  : Absolute Magnitude (log1p(|kappa|))")
     print(f"==================================================\n")
 
-    # Welford accumulators for Node thickness (1D)
+    # Welford accumulators
     node_count = 0
     node_mean = torch.zeros(1)
     node_m2 = torch.zeros(1)
 
-    # Welford accumulators for Edge features (14D)
     edge_count = 0
     edge_mean = torch.zeros(14)
     edge_m2 = torch.zeros(14)
 
-    # Taper rate (index 12) sum of squares for symmetric scaling
     taper_sq_sum = 0.0
 
-    # Reservoir buffers for distribution check (bounded RAM)
-    res_node_raw = []
-    res_node_trans = []
-    res_edge_raw = []
-    res_edge_trans = []
+    # Reservoir buffers for distribution check
+    res_node_raw, res_node_trans = [], []
+    res_edge_raw, res_edge_trans = [], []
     total_nodes_seen = 0
     total_edges_seen = 0
     k_res = args.reservoir_size
@@ -158,14 +151,13 @@ def main():
 
         # ------------------ Process Node Features ------------------
         if hasattr(data, "x") and data.x is not None and data.x.shape[0] > 0:
-            raw_t = data.x[:, 2:3]  # keep 2D: [N_nodes, 1]
+            raw_t = data.x[:, 2:3]
             trans_t = torch.log(torch.clamp(raw_t / diag, min=0.0) + 1e-5)
 
             node_count, node_mean, node_m2 = update_welford_batch(
                 node_count, node_mean, node_m2, trans_t
             )
 
-            # Reservoir sampling for nodes
             for r_val, t_val in zip(raw_t.flatten(), trans_t.flatten()):
                 if len(res_node_raw) < k_res:
                     res_node_raw.append(r_val)
@@ -182,16 +174,20 @@ def main():
             e_raw = data.edge_attr.clone()
             e_trans = e_raw.clone()
 
-            # Lengths & Thicknesses: scale by diag, log
+            # (a) Lengths and Thicknesses: scale by diag, log
             e_trans[:, [0, 3, 6, 10, 11]] = torch.log(
                 torch.clamp(e_trans[:, [0, 3, 6, 10, 11]] / diag, min=0.0) + 1e-5
             )
-            # Area: scale by area, log
+            # (b) Bounded Polygon Area: scale by area, log
             e_trans[:, 9] = torch.log(torch.clamp(e_trans[:, 9] / area, min=0.0) + 1e-5)
-            # Curves, Angles, Flare: log1p
-            e_trans[:, [1, 2, 4, 5, 7, 8, 13]] = torch.log1p(
-                torch.clamp(e_trans[:, [1, 2, 4, 5, 7, 8, 13]], min=0.0)
-            )
+
+            # (c) Curvatures (1, 4, 7): Absolute magnitude + log1p
+            curv_idx = [1, 4, 7]
+            e_trans[:, curv_idx] = torch.log1p(torch.abs(e_trans[:, curv_idx]))
+
+            # (d) Angles & Flare (2, 5, 8, 13): Non-negative + log1p
+            angle_idx = [2, 5, 8, 13]
+            e_trans[:, angle_idx] = torch.log1p(torch.clamp(e_trans[:, angle_idx], min=0.0))
 
             edge_count, edge_mean, edge_m2 = update_welford_batch(
                 edge_count, edge_mean, edge_m2, e_trans
@@ -200,7 +196,6 @@ def main():
             # Accumulate sum of squares for taper_rate (index 12)
             taper_sq_sum += (e_trans[:, 12] ** 2).sum().item()
 
-            # Reservoir sampling for edges
             for r_row, t_row in zip(e_raw, e_trans):
                 if len(res_edge_raw) < k_res:
                     res_edge_raw.append(r_row)
@@ -212,7 +207,6 @@ def main():
                         res_edge_trans[j] = t_row
                 total_edges_seen += 1
 
-        # Immediately release memory for next file
         del data
 
     if node_count == 0:
@@ -245,10 +239,9 @@ def main():
     final_edge_mean = edge_mean.clone()
     final_edge_std = torch.sqrt(edge_m2 / max(edge_count - 1, 1))
 
-    # -------------------------------------------------------------------
+    # -------------------------------------------------------------
     # POOL BOUNDARY STATISTICS (Tie Plus 'p' and Minus 'm')
-    # Exact weighted combination of both accumulators
-    # -------------------------------------------------------------------
+    # -------------------------------------------------------------
     # Lengths (3: p_length, 6: m_length)
     bdry_len_mean = 0.5 * (edge_mean[3].item() + edge_mean[6].item())
     bdry_len_m2 = 0.5 * (edge_m2[3].item() + edge_m2[6].item())
@@ -273,7 +266,6 @@ def main():
     # Enforce symmetric zero-mean for taper rate (index 12)
     final_edge_mean[12] = 0.0
     final_edge_std[12] = max(math.sqrt(taper_sq_sum / max(edge_count, 1)), 1e-6)
-
     final_edge_std = torch.clamp(final_edge_std, min=1e-6)
 
     # ------------------ 3. Formatted YAML Output ------------------

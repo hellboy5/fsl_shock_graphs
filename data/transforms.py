@@ -8,7 +8,8 @@ from torch_geometric.transforms import BaseTransform
 class NormalizeShockGraph(BaseTransform):
     """
     On-the-fly normalization transform for Shock Graphs.
-    Applies image-relative centering, log transformations, and Z-score standardization.
+    Applies image-relative centering, absolute curvature compression via log1p,
+    log transformations on spatial dimensions, and Z-score standardization.
     """
     def __init__(self, image_size, node_mean, node_std, edge_mean, edge_std):
         super().__init__()
@@ -16,7 +17,7 @@ class NormalizeShockGraph(BaseTransform):
         self.diag = math.sqrt(2.0) * self.image_size
         self.area = self.image_size * self.image_size
 
-        # Continuous node features: [x, y, t] (safely cast from OmegaConf lists)
+        # Continuous node features: [x, y, t]
         self.node_mean = torch.tensor(list(node_mean), dtype=torch.float32)
         self.node_std = torch.tensor(list(node_std), dtype=torch.float32) + 1e-6
 
@@ -59,11 +60,15 @@ class NormalizeShockGraph(BaseTransform):
             # (b) Bounded Polygon Area (index 9): scale by Area, log
             e[:, 9] = torch.log(torch.clamp(e[:, 9] / self.area, min=0.0) + 1e-5)
 
-            # (c) Curvatures, Angles, Flare (indices 1, 2, 4, 5, 7, 8, 13): log1p
-            curve_angle_idx = [1, 2, 4, 5, 7, 8, 13]
-            e[:, curve_angle_idx] = torch.log1p(torch.clamp(e[:, curve_angle_idx], min=0.0))
+            # (c) Curvatures (indices 1, 4, 7): Absolute magnitude + log1p
+            curv_idx = [1, 4, 7]
+            e[:, curv_idx] = torch.log1p(torch.abs(e[:, curv_idx]))
 
-            # (d) Standardize using broadcast vectors
+            # (d) Angles & Flare (indices 2, 5, 8, 13): Non-negative + log1p
+            angle_idx = [2, 5, 8, 13]
+            e[:, angle_idx] = torch.log1p(torch.clamp(e[:, angle_idx], min=0.0))
+
+            # (e) Standardize using broadcast vectors
             mean_vec = self.edge_mean.to(device)
             std_vec = self.edge_std.to(device)
             data.edge_attr = (e - mean_vec) / std_vec
