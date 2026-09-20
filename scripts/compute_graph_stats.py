@@ -1,27 +1,29 @@
 """
 scripts/compute_graph_stats.py
-Computes dataset-wide normalization parameters for Shock Graphs,
-inspects feature distributions, and prints the config YAML block.
-Supports toggling between coarsened (*_coarse.pt) and uncoarsened (*.pt) files.
+Computes dataset-wide normalization parameters for Shock Graphs using
+batched Welford's streaming accumulation algorithm (flat ~50MB RAM footprint).
+Enforces bilateral boundary symmetry (p == m), checks distributions via reservoir sampling,
+and prints the config YAML block.
 """
 
 import argparse
 import glob
 import math
 import os
+import random
 import torch
 from tqdm import tqdm
 
 EDGE_FEATURE_NAMES = [
-    "s_length",      # 0
-    "s_curve",       # 1
-    "s_angle",       # 2
-    "p_length",      # 3
-    "p_curve",       # 4
-    "p_angle",       # 5
-    "m_length",      # 6
-    "m_curve",       # 7
-    "m_angle",       # 8
+    "s_length",      # 0 (Spine)
+    "s_curve",       # 1 (Spine)
+    "s_angle",       # 2 (Spine)
+    "p_length",      # 3 (Plus / Left Boundary)
+    "p_curve",       # 4 (Plus / Left Boundary)
+    "p_angle",       # 5 (Plus / Left Boundary)
+    "m_length",      # 6 (Minus / Right Boundary)
+    "m_curve",       # 7 (Minus / Right Boundary)
+    "m_angle",       # 8 (Minus / Right Boundary)
     "poly_area",     # 9
     "avg_thickness", # 10
     "max_thickness", # 11
@@ -61,15 +63,44 @@ def print_distribution_summary(name, tensor):
     )
 
 
+def update_welford_batch(existing_count, existing_mean, existing_m2, batch):
+    """
+    Chan et al. / Welford parallel algorithm to update running mean and M2
+    with an incoming 2D tensor batch [batch_size, dims].
+    """
+    b_count = batch.size(0)
+    if b_count == 0:
+        return existing_count, existing_mean, existing_m2
+
+    b_mean = batch.mean(dim=0)
+    b_m2 = ((batch - b_mean) ** 2).sum(dim=0)
+
+    if existing_count == 0:
+        return b_count, b_mean, b_m2
+
+    new_count = existing_count + b_count
+    delta = b_mean - existing_mean
+    new_mean = existing_mean + delta * (b_count / new_count)
+    new_m2 = existing_m2 + b_m2 + (delta ** 2) * (existing_count * b_count / new_count)
+
+    return new_count, new_mean, new_m2
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Compute Graph Stats & Check Feature Distributions")
+    parser = argparse.ArgumentParser(description="Welford Streaming Graph Stats Computation")
     parser.add_argument("--data_root", type=str, required=True, help="Path to dataset root folder")
     parser.add_argument("--split", type=str, default="train", help="Dataset subfolder to scan (e.g. 'train')")
     parser.add_argument("--image_size", type=float, default=84.0, help="Image canvas resolution")
     parser.add_argument(
         "--use_coarse",
         action="store_true",
-        help="If set, only process files ending with '_coarse.pt'. If not set, only process uncoarsened '*.pt' files.",
+        help="If set, only process files ending with '_coarse.pt'. Otherwise process regular '*.pt' files.",
+    )
+    parser.add_argument(
+        "--reservoir_size",
+        type=int,
+        default=50000,
+        help="Size of reservoir sample for percentile inspection (default: 50,000 edges)",
     )
     args = parser.parse_args()
 
@@ -79,7 +110,6 @@ def main():
     if not all_candidate_files:
         raise FileNotFoundError(f"No .pt files found in {target_dir}")
 
-    # Disambiguate between coarse and uncoarsened files
     if args.use_coarse:
         pt_files = [f for f in all_candidate_files if f.endswith("_coarse.pt")]
         file_mode_str = "COARSENED (*_coarse.pt)"
@@ -88,10 +118,7 @@ def main():
         file_mode_str = "UNCOARSENED (*.pt, excluding *_coarse.pt)"
 
     if not pt_files:
-        raise FileNotFoundError(
-            f"No matching files found for mode {file_mode_str} under {target_dir}. "
-            f"Total .pt files scanned: {len(all_candidate_files)}"
-        )
+        raise FileNotFoundError(f"No matching files found for {file_mode_str} in {target_dir}")
 
     diag = math.sqrt(2.0) * args.image_size
     area = args.image_size * args.image_size
@@ -101,28 +128,60 @@ def main():
     print(f"Selection Mode  : {file_mode_str}")
     print(f"Matching Graphs : {len(pt_files)} (out of {len(all_candidate_files)} total .pt files)")
     print(f"Canvas Size     : {args.image_size}x{args.image_size} | Diagonal: {diag:.2f} | Area: {area:.2f}")
+    print(f"Streaming Mode  : Welford Accumulator (< 50MB RAM)")
     print(f"==================================================\n")
 
-    all_raw_node_t = []
-    all_log_node_t = []
-    all_transformed_edges = []
-    all_raw_edges = []
+    # Welford accumulators for Node thickness (1D)
+    node_count = 0
+    node_mean = torch.zeros(1)
+    node_m2 = torch.zeros(1)
 
-    for path in tqdm(pt_files, desc="Processing Graphs"):
+    # Welford accumulators for Edge features (14D)
+    edge_count = 0
+    edge_mean = torch.zeros(14)
+    edge_m2 = torch.zeros(14)
+
+    # Taper rate (index 12) sum of squares for symmetric scaling
+    taper_sq_sum = 0.0
+
+    # Reservoir buffers for distribution check (bounded RAM)
+    res_node_raw = []
+    res_node_trans = []
+    res_edge_raw = []
+    res_edge_trans = []
+    total_nodes_seen = 0
+    total_edges_seen = 0
+    k_res = args.reservoir_size
+
+    for path in tqdm(pt_files, desc="Streaming Graphs"):
         data = torch.load(path, weights_only=False)
 
-        # ------------------ Node Features ------------------
+        # ------------------ Process Node Features ------------------
         if hasattr(data, "x") and data.x is not None and data.x.shape[0] > 0:
-            raw_t = data.x[:, 2]
-            all_raw_node_t.append(raw_t)
-            all_log_node_t.append(torch.log(torch.clamp(raw_t / diag, min=0.0) + 1e-5))
+            raw_t = data.x[:, 2:3]  # keep 2D: [N_nodes, 1]
+            trans_t = torch.log(torch.clamp(raw_t / diag, min=0.0) + 1e-5)
 
-        # ------------------ Edge Features ------------------
+            node_count, node_mean, node_m2 = update_welford_batch(
+                node_count, node_mean, node_m2, trans_t
+            )
+
+            # Reservoir sampling for nodes
+            for r_val, t_val in zip(raw_t.flatten(), trans_t.flatten()):
+                if len(res_node_raw) < k_res:
+                    res_node_raw.append(r_val)
+                    res_node_trans.append(t_val)
+                else:
+                    j = random.randint(0, total_nodes_seen)
+                    if j < k_res:
+                        res_node_raw[j] = r_val
+                        res_node_trans[j] = t_val
+                total_nodes_seen += 1
+
+        # ------------------ Process Edge Features ------------------
         if hasattr(data, "edge_attr") and data.edge_attr is not None and data.edge_attr.shape[0] > 0:
             e_raw = data.edge_attr.clone()
-            all_raw_edges.append(e_raw)
-
             e_trans = e_raw.clone()
+
             # Lengths & Thicknesses: scale by diag, log
             e_trans[:, [0, 3, 6, 10, 11]] = torch.log(
                 torch.clamp(e_trans[:, [0, 3, 6, 10, 11]] / diag, min=0.0) + 1e-5
@@ -134,51 +193,88 @@ def main():
                 torch.clamp(e_trans[:, [1, 2, 4, 5, 7, 8, 13]], min=0.0)
             )
 
-            all_transformed_edges.append(e_trans)
+            edge_count, edge_mean, edge_m2 = update_welford_batch(
+                edge_count, edge_mean, edge_m2, e_trans
+            )
 
-    if len(all_raw_node_t) == 0:
+            # Accumulate sum of squares for taper_rate (index 12)
+            taper_sq_sum += (e_trans[:, 12] ** 2).sum().item()
+
+            # Reservoir sampling for edges
+            for r_row, t_row in zip(e_raw, e_trans):
+                if len(res_edge_raw) < k_res:
+                    res_edge_raw.append(r_row)
+                    res_edge_trans.append(t_row)
+                else:
+                    j = random.randint(0, total_edges_seen)
+                    if j < k_res:
+                        res_edge_raw[j] = r_row
+                        res_edge_trans[j] = t_row
+                total_edges_seen += 1
+
+        # Immediately release memory for next file
+        del data
+
+    if node_count == 0:
         raise ValueError("No valid nodes found across any matching .pt file.")
-
-    cat_raw_node_t = torch.cat(all_raw_node_t)
-    cat_log_node_t = torch.cat(all_log_node_t)
-
-    has_edges = len(all_raw_edges) > 0
-    if has_edges:
-        cat_raw_edges = torch.cat(all_raw_edges, dim=0)
-        cat_trans_edges = torch.cat(all_transformed_edges, dim=0)
 
     # ------------------ 1. Distribution Health-Check ------------------
     print("\n" + "=" * 90)
-    print(f"📊 FEATURE DISTRIBUTION HEALTH-CHECK [{file_mode_str}]")
+    print(f"📊 FEATURE DISTRIBUTION HEALTH-CHECK [{file_mode_str}] (Reservoir N={len(res_edge_raw):,})")
     print("=" * 90)
     print("Feature          |      Min |       1% |   Median |      99% |       Max |   Zeros | Flags")
     print("-" * 90)
 
-    print_distribution_summary("node_t (raw)", cat_raw_node_t)
-    print_distribution_summary("node_t (log)", cat_log_node_t)
-    print("-" * 90)
+    if res_node_raw:
+        print_distribution_summary("node_t (raw)", torch.stack(res_node_raw))
+        print_distribution_summary("node_t (log)", torch.stack(res_node_trans))
+        print("-" * 90)
 
-    if has_edges:
+    if res_edge_raw:
+        res_e_raw_cat = torch.stack(res_edge_raw)
+        res_e_trans_cat = torch.stack(res_edge_trans)
         for i, name in enumerate(EDGE_FEATURE_NAMES):
-            print_distribution_summary(f"{name} (raw)", cat_raw_edges[:, i])
-            print_distribution_summary(f"{name} (trans)", cat_trans_edges[:, i])
+            print_distribution_summary(f"{name} (raw)", res_e_raw_cat[:, i])
+            print_distribution_summary(f"{name} (trans)", res_e_trans_cat[:, i])
             print("-" * 90)
 
-    # ------------------ 2. Normalization Parameters ------------------
-    t_mean = cat_log_node_t.mean().item()
-    t_std = max(cat_log_node_t.std().item(), 1e-6)
+    # ------------------ 2. Final Normalization Parameters ------------------
+    final_node_t_mean = node_mean.item()
+    final_node_t_std = max(math.sqrt(node_m2.item() / max(node_count - 1, 1)), 1e-6)
 
-    if has_edges:
-        edge_means = cat_trans_edges.mean(dim=0)
-        edge_stds = cat_trans_edges.std(dim=0)
+    final_edge_mean = edge_mean.clone()
+    final_edge_std = torch.sqrt(edge_m2 / max(edge_count - 1, 1))
 
-        # Enforce symmetric zero-mean for taper rate (index 12)
-        edge_means[12] = 0.0
-        edge_stds[12] = torch.sqrt(torch.mean(cat_trans_edges[:, 12] ** 2))
-        edge_stds = torch.clamp(edge_stds, min=1e-6)
-    else:
-        edge_means = torch.zeros(14)
-        edge_stds = torch.ones(14)
+    # -------------------------------------------------------------------
+    # POOL BOUNDARY STATISTICS (Tie Plus 'p' and Minus 'm')
+    # Exact weighted combination of both accumulators
+    # -------------------------------------------------------------------
+    # Lengths (3: p_length, 6: m_length)
+    bdry_len_mean = 0.5 * (edge_mean[3].item() + edge_mean[6].item())
+    bdry_len_m2 = 0.5 * (edge_m2[3].item() + edge_m2[6].item())
+    bdry_len_std = max(math.sqrt(bdry_len_m2 / max(edge_count - 1, 1)), 1e-6)
+    final_edge_mean[3] = final_edge_mean[6] = bdry_len_mean
+    final_edge_std[3] = final_edge_std[6] = bdry_len_std
+
+    # Curvatures (4: p_curve, 7: m_curve)
+    bdry_curv_mean = 0.5 * (edge_mean[4].item() + edge_mean[7].item())
+    bdry_curv_m2 = 0.5 * (edge_m2[4].item() + edge_m2[7].item())
+    bdry_curv_std = max(math.sqrt(bdry_curv_m2 / max(edge_count - 1, 1)), 1e-6)
+    final_edge_mean[4] = final_edge_mean[7] = bdry_curv_mean
+    final_edge_std[4] = final_edge_std[7] = bdry_curv_std
+
+    # Angles (5: p_angle, 8: m_angle)
+    bdry_ang_mean = 0.5 * (edge_mean[5].item() + edge_mean[8].item())
+    bdry_ang_m2 = 0.5 * (edge_m2[5].item() + edge_m2[8].item())
+    bdry_ang_std = max(math.sqrt(bdry_ang_m2 / max(edge_count - 1, 1)), 1e-6)
+    final_edge_mean[5] = final_edge_mean[8] = bdry_ang_mean
+    final_edge_std[5] = final_edge_std[8] = bdry_ang_std
+
+    # Enforce symmetric zero-mean for taper rate (index 12)
+    final_edge_mean[12] = 0.0
+    final_edge_std[12] = max(math.sqrt(taper_sq_sum / max(edge_count, 1)), 1e-6)
+
+    final_edge_std = torch.clamp(final_edge_std, min=1e-6)
 
     # ------------------ 3. Formatted YAML Output ------------------
     print("\n" + "=" * 50)
@@ -186,11 +282,11 @@ def main():
     print("=" * 50)
     print("graph:")
     print(f"  image_size: {int(args.image_size)}")
-    print(f"  node_mean: [0.0, 0.0, {t_mean:.4f}]")
-    print(f"  node_std:  [1.0, 1.0, {t_std:.4f}]")
+    print(f"  node_mean: [0.0, 0.0, {final_node_t_mean:.4f}]")
+    print(f"  node_std:  [1.0, 1.0, {final_node_t_std:.4f}]")
 
-    edge_mean_str = ", ".join([f"{x:.4f}" for x in edge_means.tolist()])
-    edge_std_str = ", ".join([f"{x:.4f}" for x in edge_stds.tolist()])
+    edge_mean_str = ", ".join([f"{x:.4f}" for x in final_edge_mean.tolist()])
+    edge_std_str = ", ".join([f"{x:.4f}" for x in final_edge_std.tolist()])
     print(f"  edge_mean: [{edge_mean_str}]")
     print(f"  edge_std:  [{edge_std_str}]")
     print("=" * 50 + "\n")
