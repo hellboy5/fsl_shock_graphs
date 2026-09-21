@@ -88,13 +88,25 @@ def get_vision_transform(cfg):
 
 
 def get_graph_transform(cfg):
-    """Instantiates the shock graph transform using the dataset config."""
+    """
+    Instantiates the shock graph transform, automatically selecting 
+    coarse or uncoarse stats based on use_coarse.
+    """
     if hasattr(cfg.dataset, "graph") and cfg.dataset.graph is not None:
+        g_cfg = cfg.dataset.graph
+        use_coarse = getattr(g_cfg, "use_coarse", False)
+
+        # Select the stats sub-block if present, else fallback to top-level
+        if hasattr(g_cfg, "coarse") and hasattr(g_cfg, "uncoarse"):
+            stats = g_cfg.coarse if use_coarse else g_cfg.uncoarse
+        else:
+            stats = g_cfg
+
         return NormalizeShockGraph(
-            image_size=getattr(cfg.dataset.graph, "image_size", cfg.dataset.vision.image_size),
-            node_mean=cfg.dataset.graph.node_mean,
-            node_std=cfg.dataset.graph.node_std,
-            edge_mean=cfg.dataset.graph.edge_mean,
-            edge_std=cfg.dataset.graph.edge_std,
+            image_size=getattr(g_cfg, "image_size", cfg.dataset.vision.image_size),
+            node_mean=stats.node_mean,
+            node_std=stats.node_std,
+            edge_mean=stats.edge_mean,
+            edge_std=stats.edge_std,
         )
     return None

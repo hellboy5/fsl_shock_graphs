@@ -1,18 +1,38 @@
 # configs/dataset/mini_imagenet.yaml
 name: "mini_imagenet"
-data_root: "/path/to/your/dataset"      # Update this to your actual path
-num_classes: 100
+data_root: "/users/mnarayan/data/mnarayan/mini_imagenet"
+num_classes: 64
+num_val_classes: 16
+num_test_classes: 20
 
-# Image Normalization (Standard ImageNet)
 vision:
   image_size: 84
   mean: [0.485, 0.456, 0.406]
   std:  [0.229, 0.224, 0.225]
 
-# Graph Normalization 
-# (Based on the outputs of your compute_graph_stats.py script)
 graph:
-  node_mean: [0.0, 0.0, 0.0]  
-  node_std:  [1.0, 1.0, 1.0]
-  edge_mean: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  edge_std:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # -------------------------------------------------------------------------
+  # SWITCH: true for coarsened (*_coarse.pt), false for uncoarsened (*.pt)
+  # -------------------------------------------------------------------------
+  use_coarse: true
+  image_size: 84
+  node_feat_dim: 11
+  edge_feat_dim: 14
+
+  # =========================================================================
+  # 1. COARSENED STATS (Auto-selected when use_coarse: true)
+  # =========================================================================
+  coarse:
+    node_mean: [0.0000, 0.0000, -4.7841]
+    node_std:  [1.0000, 1.0000,  2.8085]
+    edge_mean: [-2.7235, 0.1364, 0.1750, -3.9838, 0.1639, 0.3833, -3.9838, 0.1639, 0.3833, -5.2735, -3.5030, -3.0329, 0.0000, 0.7982]
+    edge_std:  [ 1.1500, 0.2304, 0.2980,  2.5565, 0.2935, 0.6837,  2.5565, 0.2935, 0.6837,  1.8933,  1.1304,  1.0966, 0.4442, 0.5725]
+
+  # =========================================================================
+  # 2. UNCOARSENED STATS (Auto-selected when use_coarse: false)
+  # =========================================================================
+  uncoarse:
+    node_mean: [0.0000, 0.0000, -3.8512]
+    node_std:  [1.0000, 1.0000,  1.8421]
+    edge_mean: [-3.8520, 0.0784, 0.1190, -4.4810, 0.0982, 0.2514, -4.4810, 0.0982, 0.2514, -6.8120, -4.1023, -3.7145, 0.0000, 0.6421]
+    edge_std:  [ 1.1042, 0.1812, 0.2195,  2.2140, 0.2105, 0.5482,  2.2140, 0.2105, 0.5482,  1.6120,  1.0514,  1.0189, 0.4210, 0.5012]

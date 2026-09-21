@@ -1,7 +1,6 @@
 defaults:
   - dataset: mini_imagenet
 
-
 mode: "train"               # 'train' or 'eval'
 seed: 42
 checkpoint_path: "none"     # Update this when running eval
@@ -19,14 +18,16 @@ task:
   train_episodes: 100
   val_episodes: 500
   test_episodes: 2000
-  fsl_method: "protonet"        # 'protonet' or 'matching'
-  distance_metric: "euclidean"  # 'euclidean' or 'cosine'
-  use_simpleshot: False         # Set True to enable CL2N
 
 model:
-  modality: "graph"             # 'vision', 'graph', or 'fusion'
+  modality: "graph"             # 'vision', 'graph', or 'multimodal'
   hidden_dim: 128
-  node_dim: 11
-  edge_dim: 14
+  node_feat_dim: 11             # Synchronized with multimodal_network.py
+  edge_feat_dim: 14             # Synchronized with multimodal_network.py
+  num_layers: 3                 # Required by GraphEncoder
+  dropout: 0.1                  # Required by GraphEncoder
   gnn_type: "GINE"              # 'GINE', 'GATv2', 'ResGated', 'GPS'
   fusion_type: "concat"         # 'concat', 'add', 'gate'
+  fsl_method: "protonet"        # 'protonet' or 'matching'
+  distance_metric: "euclidean"  # 'euclidean' or 'cosine'
+  use_simpleshot: false         # Set true to enable CL2N
