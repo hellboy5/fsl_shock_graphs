@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 
 # Ensure these import paths match your exact file structure
-from .cnn_encoder import VisionEncoder
-from .gnn_encoder import GraphEncoder
-from .fusion import MultimodalFusion
-from .heads import FewShotClassifier
+from models.encoders.cnn_encoder import VisionEncoder
+from models.encoders.gnn_encoder import GraphEncoder
+from models.fusion import MultimodalFusion
+from models.heads import FewShotClassifier
 
 class MultimodalFewShotNetwork(nn.Module):
     """
@@ -81,4 +81,3 @@ class MultimodalFewShotNetwork(nn.Module):
         logits = self.classifier(support_features, query_features, n_way, k_shot)
         
         return logits
-`
