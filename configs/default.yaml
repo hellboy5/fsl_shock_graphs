@@ -1,33 +1,57 @@
+# configs/default.yaml
 defaults:
   - dataset: mini_imagenet
+  - _self_
 
-mode: "train"               # 'train' or 'eval'
+# Global Execution Settings
+mode: "train"
 seed: 42
-checkpoint_path: "none"     # Update this when running eval
+device: "cuda"
 
-training:
-  epochs: 100
-  lr: 0.1
-  weight_decay: 0.0005
-  save_dir: "experiments"
-
+# Few-Shot Task Settings
 task:
   n_way: 5
   n_shot: 1
   n_query: 15
-  train_episodes: 100
-  val_episodes: 500
+  train_episodes: 200
+  val_episodes: 600
   test_episodes: 2000
 
+# Model Architecture Configuration
 model:
-  modality: "graph"             # 'vision', 'graph', or 'multimodal'
+  modality: "multimodal"        # Options: 'vision', 'graph', 'multimodal'
   hidden_dim: 128
-  node_feat_dim: 11             # Synchronized with multimodal_network.py
-  edge_feat_dim: 14             # Synchronized with multimodal_network.py
-  num_layers: 3                 # Required by GraphEncoder
-  dropout: 0.1                  # Required by GraphEncoder
-  gnn_type: "GINE"              # 'GINE', 'GATv2', 'ResGated', 'GPS'
-  fusion_type: "concat"         # 'concat', 'add', 'gate'
-  fsl_method: "protonet"        # 'protonet' or 'matching'
-  distance_metric: "euclidean"  # 'euclidean' or 'cosine'
-  use_simpleshot: false         # Set true to enable CL2N
+  node_feat_dim: 11
+  edge_feat_dim: 14
+  num_layers: 3
+  dropout: 0.1
+  gnn_type: "GINE"              # Options: 'GINE', 'GATv2', 'ResGated', 'GPS'
+  norm_type: "graph"            # Options: 'graph', 'layer', 'batch' (Cai et al., ICML 2021)
+  use_dual_pool: true           # Dual-Pooling [Mean || Max] Readout (Xu et al., ICLR 2019)
+  fusion_type: "concat"         # Options: 'concat', 'add', 'gate'
+  fsl_method: "protonet"        # Options: 'protonet', 'matching'
+  distance_metric: "euclidean"  # Options: 'euclidean', 'cosine'
+  use_simpleshot: false
+
+# Training Hyperparameters
+training:
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0005
+  lr_decay_step: 20
+  lr_decay_gamma: 0.5
+  save_dir: "experiments/multimodal_5w1s"
+  num_workers: 4
+
+# Evaluation Settings
+evaluation:
+  checkpoint_path: null
+  test_episodes: 2000
+
+# =============================================================================
+# Option A: Route Hydra outputs directly into training.save_dir
+# Prevents creating duplicate 'outputs/' directories on disk
+# =============================================================================
+hydra:
+  run:
+    dir: ${training.save_dir}
