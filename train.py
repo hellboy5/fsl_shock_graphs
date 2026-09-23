@@ -12,8 +12,6 @@ from data.transforms import get_graph_transform, get_vision_transform
 from models.multimodal_network import MultimodalFewShotNetwork
 from torch_geometric.data import Batch
 
-import torch
-from torch_geometric.data import Batch
 
 def collate_fn(data_list):
     # 1. Safely check if images exist in the batch (multimodal/vision mode)
@@ -34,9 +32,11 @@ def collate_fn(data_list):
         'graph': batched_graphs
     }
 
+
 def calculate_accuracy(logits, targets):
     pred = logits.argmax(dim=1)
     return (pred == targets).float().mean().item() * 100.0
+
 
 def run_training(cfg, device):
     # Setup Dirs
@@ -44,35 +44,55 @@ def run_training(cfg, device):
     save_dir = os.path.join(cfg.training.save_dir, f"run_{timestamp}")
     os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
     
-    # Setup Data
     # Setup Data Transforms (Driven entirely by config)
     v_transform = get_vision_transform(cfg)
     g_transform = get_graph_transform(cfg)
         
-    train_set = MultimodalFSLDataset(cfg.dataset,
-                                     modality=cfg.model.modality,
-                                     split='train',
-                                     vision_transform=v_transform,
-                                     graph_transform=g_transform)
+    train_set = MultimodalFSLDataset(
+        cfg.dataset,
+        modality=cfg.model.modality,
+        split='train',
+        vision_transform=v_transform,
+        graph_transform=g_transform
+    )
     
-    val_set = MultimodalFSLDataset(cfg.dataset,
-                                   modality=cfg.model.modality,
-                                   split='val',
-                                   vision_transform=v_transform,
-                                   graph_transform=g_transform)
+    val_set = MultimodalFSLDataset(
+        cfg.dataset,
+        modality=cfg.model.modality,
+        split='val',
+        vision_transform=v_transform,
+        graph_transform=g_transform
+    )
 
     n_way, n_shot, n_query = cfg.task.n_way, cfg.task.n_shot, cfg.task.n_query
 
     train_sampler = EpisodicBatchSampler(train_set.labels, train_set.base_names, n_way, n_shot, n_query, cfg.task.train_episodes)
     val_sampler = EpisodicBatchSampler(val_set.labels, val_set.base_names, n_way, n_shot, n_query, cfg.task.val_episodes)
 
-    train_loader = DataLoader(train_set, batch_sampler=train_sampler, collate_fn=collate_fn)
-    val_loader = DataLoader(val_set, batch_sampler=val_sampler, collate_fn=collate_fn)
+    train_loader = DataLoader(train_set, batch_sampler=train_sampler, collate_fn=collate_fn, num_workers=getattr(cfg.training, 'num_workers', 2))
+    val_loader = DataLoader(val_set, batch_sampler=val_sampler, collate_fn=collate_fn, num_workers=getattr(cfg.training, 'num_workers', 2))
 
-    # Setup Model & Optim
+    # Setup Model
     model = MultimodalFewShotNetwork(cfg).to(device)
-    optimizer = optim.SGD(model.parameters(), lr=cfg.training.lr, momentum=0.9, weight_decay=cfg.training.weight_decay)
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[40, 80], gamma=0.1)
+
+    # -------------------------------------------------------------
+    # CHANGE 1: AdamW Optimizer (Loshchilov & Hutter, ICLR 2019)
+    # Decouples weight decay to balance updates across CNN and GNN
+    # -------------------------------------------------------------
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay
+    )
+
+    # -------------------------------------------------------------
+    # CHANGE 2: Cosine Annealing Schedule (Smooth decay to 1e-6 floor)
+    # -------------------------------------------------------------
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cfg.training.epochs,
+        eta_min=1e-6
+    )
 
     targets = torch.arange(n_way).repeat_interleave(n_query).long().to(device)
     best_val_acc = 0.0
@@ -89,6 +109,13 @@ def run_training(cfg, device):
             logits = model(img_batch, graph_batch, n_way, n_shot)
             loss = F.cross_entropy(logits, targets)
             loss.backward()
+
+            # ---------------------------------------------------------
+            # CHANGE 3: Gradient Clipping (max_norm=1.0)
+            # Prevents gradient spikes from complex graph topologies
+            # ---------------------------------------------------------
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             train_losses.append(loss.item())
             train_accs.append(calculate_accuracy(logits, targets))
@@ -112,8 +139,8 @@ def run_training(cfg, device):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'best_val_acc': best_val_acc,
-                'cfg': cfg # Save the config so eval knows what model to build
+                'cfg': cfg  # Save config so eval.py knows what model to build
             }, os.path.join(save_dir, 'checkpoints', 'best_model.pth'))
-            print("  -> New Best Model Saved!")
+            print(f"  -> New Best Model Saved! ({best_val_acc:.2f}%)")
 
         scheduler.step()
