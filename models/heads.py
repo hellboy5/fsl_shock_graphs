@@ -1,66 +1,107 @@
+# models/heads.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class FewShotClassifier(nn.Module):
-    def __init__(self, method='protonet', distance='euclidean', use_simpleshot=False):
+    """
+    Benchmark-Compliant Few-Shot Classification Head with L2 Normalization.
+    
+    Academic Foundations:
+      1. Prototypical Centroids:
+         - Snell et al., "Prototypical Networks for Few-shot Learning", NeurIPS 2017.
+      2. Unit-Hypersphere Normalization (SimpleShot):
+         - Wang et al., "SimpleShot: Revisiting Nearest-Neighbor Classification 
+           for Few-Shot Learning", arXiv:1911.04623.
+      3. Temperature-Scaled Cosine Classification:
+         - Chen et al., "A Closer Look at Few-Shot Classification", ICLR 2019.
+         - DeepEMD: Zhang et al., CVPR 2020.
+         - FRN: Wertheimer et al., CVPR 2021.
+    """
+    def __init__(
+        self, 
+        method: str = 'protonet', 
+        distance: str = 'cosine', 
+        scale: float = 10.0, 
+        use_simpleshot: bool = False
+    ):
         """
         Args:
-            method: 'protonet' (nearest centroid) or 'matching' (nearest neighbor)
-            distance: 'euclidean' or 'cosine'
-            use_simpleshot: Applies CL2N (Centered L2-Normalization) from arXiv:1911.04623
+            method: 'protonet' (nearest centroid) or 'matching' (pairwise comparison)
+            distance: 'cosine' (recommended) or 'euclidean' (normalized)
+            scale: Inverse temperature scaling factor (standard 10.0 in FSL)
+            use_simpleshot: Optional task-level mean subtraction before normalization
         """
         super().__init__()
-        self.method = method
-        self.distance = distance
+        self.method = method.lower()
+        self.distance = distance.lower()
+        self.scale = scale
         self.use_simpleshot = use_simpleshot
 
-    def forward(self, support, query, n_way, k_shot):
+    def forward(
+        self, 
+        support: torch.Tensor, 
+        query: torch.Tensor, 
+        n_way: int, 
+        k_shot: int
+    ) -> torch.Tensor:
         """
         Args:
             support: [n_way * k_shot, dim]
-            query: [n_query_total, dim]
+            query:   [n_query_total, dim]
+            n_way:   Number of classes in the episode
+            k_shot:  Number of support shots per class
+            
+        Returns:
+            logits:  [n_query_total, n_way]
         """
-        # ---------------------------------------------------------
-        # 1. SimpleShot Feature Transformation (CL2N)
-        # ---------------------------------------------------------
+        # 1. Optional Task-Level Centering (SimpleShot / Wang et al., 2019)
         if self.use_simpleshot:
-            # Centering: Subtract the mean of the support set (Task-level centering)
-            # (Note: For exact SimpleShot, you can pass in the global train-set mean here)
             support_mean = support.mean(dim=0, keepdim=True)
             support = support - support_mean
             query = query - support_mean
 
-            # L2-Normalization
-            support = F.normalize(support, p=2, dim=-1)
-            query = F.normalize(query, p=2, dim=-1)
+        # 2. Mandatory L2 Feature Normalization
+        # Projects all support and query vectors onto the unit hypersphere: ||z||_2 = 1.0
+        # Prevents initial loss spikes and eliminates magnitude bias.
+        support = F.normalize(support, p=2, dim=-1)
+        query = F.normalize(query, p=2, dim=-1)
 
-        # ---------------------------------------------------------
-        # 2. Few-Shot Evaluation
-        # ---------------------------------------------------------
+        dim = support.size(-1)
+
+        # 3. Metric Evaluation
         if self.method == 'protonet':
-            # Prototype Approach (Nearest Centroid)
-            prototypes = support.view(n_way, k_shot, -1).mean(1) # [n_way, dim]
-            
-            if self.distance == 'euclidean':
-                logits = -torch.cdist(query, prototypes) ** 2
-            elif self.distance == 'cosine':
-                logits = self.cosine_sim(query, prototypes)
-                
+            # Class Centroid c_k as the average of support vectors
+            prototypes = support.view(n_way, k_shot, dim).mean(dim=1)
+            # Re-normalize class prototype onto unit hypersphere (SimpleShot standard)
+            prototypes = F.normalize(prototypes, p=2, dim=-1)
+
+            if self.distance == 'cosine':
+                # Scaled Cosine Similarity (DeepEMD / Chen et al.)
+                logits = self.scale * torch.mm(query, prototypes.t())
+            elif self.distance == 'euclidean':
+                # Normalized Euclidean Distance: ||u - v||^2 in range
+                dists = torch.cdist(query, prototypes, p=2) ** 2
+                logits = -(self.scale / 2.0) * dists
+            else:
+                raise ValueError(f"Unknown distance metric: {self.distance}")
+
         elif self.method == 'matching':
-            # Matching Network Approach (Nearest Neighbor Pairwise)
-            if self.distance == 'euclidean':
-                sims = -torch.cdist(query, support) ** 2
-            elif self.distance == 'cosine':
-                sims = self.cosine_sim(query, support) 
-            
-            # Aggregate pairwise similarities by class
+            # Matching Network: Pairwise nearest-neighbor evaluation
+            if self.distance == 'cosine':
+                sims = self.scale * torch.mm(query, support.t())
+            elif self.distance == 'euclidean':
+                dists = torch.cdist(query, support, p=2) ** 2
+                sims = -(self.scale / 2.0) * dists
+            else:
+                raise ValueError(f"Unknown distance metric: {self.distance}")
+
+            # Average similarities across support exemplars per class
             sims = sims.view(query.size(0), n_way, k_shot)
-            logits = sims.mean(2)
+            logits = sims.mean(dim=2)
+
+        else:
+            raise ValueError(f"Unknown FSL method: {self.method}")
 
         return logits
-
-    def cosine_sim(self, x, y):
-        x_norm = F.normalize(x, p=2, dim=-1)
-        y_norm = F.normalize(y, p=2, dim=-1)
-        return torch.mm(x_norm, y_norm.t())
