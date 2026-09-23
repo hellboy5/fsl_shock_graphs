@@ -1,10 +1,10 @@
+# train.py
 import os
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-from datetime import datetime
 
 from data.dataset import MultimodalFSLDataset
 from data.samplers import EpisodicBatchSampler
@@ -39,9 +39,8 @@ def calculate_accuracy(logits, targets):
 
 
 def run_training(cfg, device):
-    # Setup Dirs
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    save_dir = os.path.join(cfg.training.save_dir, f"run_{timestamp}")
+    # Setup Dirs: Save directly into the exact path configured by Hydra
+    save_dir = cfg.training.save_dir
     os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
     
     # Setup Data Transforms (Driven entirely by config)
@@ -75,19 +74,14 @@ def run_training(cfg, device):
     # Setup Model
     model = MultimodalFewShotNetwork(cfg).to(device)
 
-    # -------------------------------------------------------------
-    # CHANGE 1: AdamW Optimizer (Loshchilov & Hutter, ICLR 2019)
-    # Decouples weight decay to balance updates across CNN and GNN
-    # -------------------------------------------------------------
+    # 1. AdamW Optimizer (Loshchilov & Hutter, ICLR 2019)
     optimizer = optim.AdamW(
         model.parameters(),
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay
     )
 
-    # -------------------------------------------------------------
-    # CHANGE 2: Cosine Annealing Schedule (Smooth decay to 1e-6 floor)
-    # -------------------------------------------------------------
+    # 2. Cosine Annealing Schedule (Smooth decay to 1e-6 floor)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cfg.training.epochs,
@@ -107,13 +101,11 @@ def run_training(cfg, device):
             img_batch = batch['image'].to(device) if batch['image'] is not None else None
             graph_batch = batch['graph'].to(device)
             logits = model(img_batch, graph_batch, n_way, n_shot)
+
             loss = F.cross_entropy(logits, targets)
             loss.backward()
 
-            # ---------------------------------------------------------
-            # CHANGE 3: Gradient Clipping (max_norm=1.0)
-            # Prevents gradient spikes from complex graph topologies
-            # ---------------------------------------------------------
+            # 3. Gradient Clipping (max_norm=1.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
@@ -139,7 +131,7 @@ def run_training(cfg, device):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'best_val_acc': best_val_acc,
-                'cfg': cfg  # Save config so eval.py knows what model to build
+                'cfg': cfg
             }, os.path.join(save_dir, 'checkpoints', 'best_model.pth'))
             print(f"  -> New Best Model Saved! ({best_val_acc:.2f}%)")
 
