@@ -1,3 +1,4 @@
+# eval.py
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -7,37 +8,52 @@ from data.transforms import get_graph_transform, get_vision_transform
 from models.multimodal_network import MultimodalFewShotNetwork
 from train import collate_fn, calculate_accuracy
 
+
 def compute_confidence_interval(data):
     a = 1.0 * np.array(data)
     m = np.mean(a)
     pm = 1.96 * (np.std(a) / np.sqrt(len(a)))
     return m, pm
 
+
 def run_evaluation(cfg, device):
-    # Extract evaluation parameters from the runtime config
-    checkpoint_path = cfg.checkpoint_path
+    # Extract evaluation parameters from the runtime config (supports root or evaluation block)
+    checkpoint_path = getattr(cfg, 'checkpoint_path', None) or getattr(cfg.evaluation, 'checkpoint_path', None)
+    if not checkpoint_path:
+        raise ValueError("No checkpoint_path specified! Pass checkpoint_path=... on the command line.")
+
     eval_n_way = cfg.task.n_way
     eval_n_shot = cfg.task.n_shot
     eval_n_query = cfg.task.n_query
     
-    # Use 2000 episodes for testing, unless overridden in config
-    eval_episodes = cfg.task.get('eval_episodes', 2000)
+    # Use 2000 episodes for testing (checks task.eval_episodes, task.test_episodes, then default 2000)
+    eval_episodes = cfg.task.get('eval_episodes', getattr(cfg.task, 'test_episodes', 2000))
     
     # 1. Load Checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    train_cfg = checkpoint['cfg'] # Retrieve the config used during training to rebuild model
+    train_cfg = checkpoint['cfg']  # Retrieve the config used during training to rebuild model
     
     print(f"Loaded checkpoint from Epoch {checkpoint['epoch']} (Original Val Acc: {checkpoint['best_val_acc']:.2f}%)")
     print(f"Evaluating on {eval_n_way}-Way {eval_n_shot}-Shot ({eval_episodes} episodes)")
     
-    # 2. Setup Test Data (Using the NEW evaluation parameters)
-    test_set = MultimodalFSLDataset(cfg.dataset,
-                                    modality=train_cfg.model.modality,
-                                    split='test', 
-                                    vision_transform=get_vision_transform(train_cfg), 
-                                    graph_transform=get_graph_transform(train_cfg))
+    # 2. Setup Test Data (Using deterministic test transforms)
+    test_set = MultimodalFSLDataset(
+        cfg.dataset,
+        modality=train_cfg.model.modality,
+        split='test', 
+        vision_transform=get_vision_transform(train_cfg), 
+        graph_transform=get_graph_transform(train_cfg)
+    )
     
-    test_sampler = EpisodicBatchSampler(test_set.labels, eval_n_way, eval_n_shot, eval_n_query, eval_episodes)
+    # FIX: Pass test_set.base_names so the sampler doesn't crash on zip()
+    test_sampler = EpisodicBatchSampler(
+        test_set.labels, 
+        test_set.base_names, 
+        eval_n_way, 
+        eval_n_shot, 
+        eval_n_query, 
+        eval_episodes
+    )
     test_loader = DataLoader(test_set, batch_sampler=test_sampler, collate_fn=collate_fn)
 
     # 3. Setup Model (Built with train_cfg to match weights exactly)
@@ -60,6 +76,7 @@ def run_evaluation(cfg, device):
 
     mean, ci = compute_confidence_interval(test_accs)
     print(f"\nFinal Test Results: {mean:.2f}% ± {ci:.2f}%\n")
+
 
 if __name__ == "__main__":
     pass

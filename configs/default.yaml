@@ -7,6 +7,7 @@ defaults:
 mode: "train"
 seed: 42
 device: "cuda"
+checkpoint_path: null           # Added at root to support main.py eval routing
 
 # Few-Shot Task Settings
 task:
@@ -31,17 +32,15 @@ model:
   fusion_type: "dual_gate"      # Options: 'dual_gate', 'concat', 'add'
   modality_dropout: 0.0         # Options: 0.0 (off) or 0.15 (on)
   fsl_method: "protonet"        # Options: 'protonet', 'matching'
-  distance_metric: "euclidean"  # Options: 'euclidean', 'cosine'
+  distance_metric: "cosine"     # Options: 'cosine', 'euclidean'
   use_simpleshot: false
 
 # Training Hyperparameters
 training:
   epochs: 100
   lr: 0.001
-  weight_decay: 0.0005
-  lr_decay_step: 20
-  lr_decay_gamma: 0.5
-  save_dir: "experiments/multimodal_5w1s"
+  weight_decay: 0.0001          # Standard AdamW decoupled weight decay
+  save_dir: "experiments/multimodal_dual_gate_5w1s"
   num_workers: 4
 
 # Evaluation Settings
