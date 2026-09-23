@@ -37,12 +37,13 @@ class MultimodalFewShotNetwork(nn.Module):
                 norm_type=getattr(cfg.model, 'norm_type', 'graph'),
                 use_dual_pool=getattr(cfg.model, 'use_dual_pool', True)
             )
-            
+
         # --- 3. Fusion Block ---
         if self.modality == 'multimodal':
             self.fusion = MultimodalFusion(
                 proj_feat_dim=cfg.model.hidden_dim, 
-                fusion_type=cfg.model.fusion_type
+                fusion_type=cfg.model.fusion_type,
+                modality_dropout=getattr(cfg.model, 'modality_dropout', 0.0)
             )
             
         # --- 4. Few-Shot Head ---
