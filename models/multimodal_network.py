@@ -1,3 +1,4 @@
+# models/multimodal_network.py
 import torch
 import torch.nn as nn
 
@@ -6,6 +7,7 @@ from models.encoders.cnn_encoder import VisionEncoder
 from models.encoders.gnn_encoder import GraphEncoder
 from models.fusion import MultimodalFusion
 from models.heads import FewShotClassifier
+
 
 class MultimodalFewShotNetwork(nn.Module):
     """
@@ -23,6 +25,7 @@ class MultimodalFewShotNetwork(nn.Module):
             
         # --- 2. Graph Pathway ---
         if self.modality in ['graph', 'multimodal']:
+            # Upgraded constructor to forward GraphNorm/LayerNorm and Dual Pooling settings
             self.graph_encoder = GraphEncoder(
                 node_feat_dim=cfg.model.node_feat_dim,
                 edge_feat_dim=cfg.model.edge_feat_dim,
@@ -30,12 +33,13 @@ class MultimodalFewShotNetwork(nn.Module):
                 proj_feat_dim=cfg.model.hidden_dim,
                 gnn_type=cfg.model.gnn_type,
                 num_layers=cfg.model.num_layers,
-                dropout=cfg.model.dropout
+                dropout=cfg.model.dropout,
+                norm_type=getattr(cfg.model, 'norm_type', 'graph'),
+                use_dual_pool=getattr(cfg.model, 'use_dual_pool', True)
             )
             
         # --- 3. Fusion Block ---
         if self.modality == 'multimodal':
-            # FIX: Unpack the config explicitly
             self.fusion = MultimodalFusion(
                 proj_feat_dim=cfg.model.hidden_dim, 
                 fusion_type=cfg.model.fusion_type
