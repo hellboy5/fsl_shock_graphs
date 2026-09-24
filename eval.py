@@ -29,8 +29,8 @@ def run_evaluation(cfg, device):
     # Use 2000 episodes for testing (checks task.eval_episodes, task.test_episodes, then default 2000)
     eval_episodes = cfg.task.get('eval_episodes', getattr(cfg.task, 'test_episodes', 2000))
     
-    # 1. Load Checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # 1. Load Checkpoint (Explicitly bypasses PyTorch 2.6 weights_only constraint)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     train_cfg = checkpoint['cfg']  # Retrieve the config used during training to rebuild model
     
     print(f"Loaded checkpoint from Epoch {checkpoint['epoch']} (Original Val Acc: {checkpoint['best_val_acc']:.2f}%)")
@@ -45,7 +45,7 @@ def run_evaluation(cfg, device):
         graph_transform=get_graph_transform(train_cfg)
     )
     
-    # FIX: Pass test_set.base_names so the sampler doesn't crash on zip()
+    # Pass test_set.base_names so the sampler doesn't crash on zip()
     test_sampler = EpisodicBatchSampler(
         test_set.labels, 
         test_set.base_names, 
