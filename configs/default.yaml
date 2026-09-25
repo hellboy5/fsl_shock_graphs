@@ -28,7 +28,9 @@ model:
   dropout: 0.1
   gnn_type: "GINE"              # Options: 'GINE', 'GATv2', 'ResGated', 'GPS'
   norm_type: "graph"            # Options: 'graph', 'layer', 'batch' (Cai et al., ICML 2021)
-  use_dual_pool: true           # Dual-Pooling [Mean || Max] Readout (Xu et al., ICLR 2019)
+  use_dual_pool: false          # Dual-Pooling [Mean || Max] Readout (Xu et al., ICLR 2019)
+  train_eps: false              # Options: Trainable epsilon in GINE
+  use_input_mlp: false          # Options: 2-layer non-linear input MLP
   fusion_type: "dual_gate"      # Options: 'dual_gate', 'concat', 'add'
   modality_dropout: 0.0         # Options: 0.0 (off) or 0.15 (on)
   fsl_method: "protonet"        # Options: 'protonet', 'matching'

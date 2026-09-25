@@ -35,7 +35,9 @@ class MultimodalFewShotNetwork(nn.Module):
                 num_layers=cfg.model.num_layers,
                 dropout=cfg.model.dropout,
                 norm_type=getattr(cfg.model, 'norm_type', 'graph'),
-                use_dual_pool=getattr(cfg.model, 'use_dual_pool', True)
+                use_dual_pool=getattr(cfg.model, 'use_dual_pool', False),
+                train_eps=getattr(cfg.model, 'train_eps', False),        
+                use_input_mlp=getattr(cfg.model, 'use_input_mlp', False) 
             )
 
         # --- 3. Fusion Block ---
