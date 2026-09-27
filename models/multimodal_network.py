@@ -52,7 +52,6 @@ class MultimodalFewShotNetwork(nn.Module):
         self.classifier = FewShotClassifier(
             method=cfg.model.fsl_method,
             distance=cfg.model.distance_metric,
-            use_simpleshot=cfg.model.use_simpleshot
         )
 
     def forward(self, vision_batch, graph_batch, n_way, k_shot):
