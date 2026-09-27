@@ -25,7 +25,6 @@ class MultimodalFewShotNetwork(nn.Module):
             
         # --- 2. Graph Pathway ---
         if self.modality in ['graph', 'multimodal']:
-            # Upgraded constructor to forward GraphNorm/LayerNorm and Dual Pooling settings
             self.graph_encoder = GraphEncoder(
                 node_feat_dim=cfg.model.node_feat_dim,
                 edge_feat_dim=cfg.model.edge_feat_dim,
@@ -37,7 +36,8 @@ class MultimodalFewShotNetwork(nn.Module):
                 norm_type=getattr(cfg.model, 'norm_type', 'graph'),
                 use_dual_pool=getattr(cfg.model, 'use_dual_pool', False),
                 train_eps=getattr(cfg.model, 'train_eps', False),        
-                use_input_mlp=getattr(cfg.model, 'use_input_mlp', False) 
+                use_input_mlp=getattr(cfg.model, 'use_input_mlp', False),
+                use_jk=getattr(cfg.model, 'use_jk', False)                # <--- JK-Net forward
             )
 
         # --- 3. Fusion Block ---
@@ -75,16 +75,11 @@ class MultimodalFewShotNetwork(nn.Module):
             raise ValueError(f"Unknown modality configured: {self.modality}")
             
         # --- B. Episodic Splitting ---
-        # Because the EpisodicBatchSampler perfectly ordered the batch as 
-        # [Support_Class1... Support_ClassN, Query_Class1... Query_ClassN],
-        # we can safely slice the tensor purely by index.
         k_total = n_way * k_shot
         support_features = features[:k_total]
         query_features = features[k_total:]
         
         # --- C. Prototypical Classification ---
-        # The FewShotClassifier handles the .view() reshaping, prototype 
-        # centroid calculation, and distance metric computation.
         logits = self.classifier(support_features, query_features, n_way, k_shot)
         
         return logits

@@ -27,10 +27,11 @@ class TAGCN_EdgeAugmented(nn.Module):
     Integrates 14D differential edge features into the node state before 
     applying Topology Adaptive Graph Convolutions (arXiv:1710.10370).
     """
-    def __init__(self, node_feat_dim, edge_feat_dim, hidden_dim, num_layers, dropout, K_hops=2, use_input_mlp=False):
+    def __init__(self, node_feat_dim, edge_feat_dim, hidden_dim, num_layers, dropout, K_hops=2, use_input_mlp=False, use_jk=False):
         super(TAGCN_EdgeAugmented, self).__init__()
         self.num_layers = num_layers
         self.dropout = dropout
+        self.use_jk = use_jk
 
         # 1. Input Projections (1-Layer or 2-Layer MLP)
         if use_input_mlp:
@@ -96,6 +97,7 @@ class TAGCN_EdgeAugmented(nn.Module):
         # Non-linear node-edge fusion via concatenation
         x = self.fusion(torch.cat([x_proj, edge_context], dim=-1))
 
+        layer_outputs = []
         # Multi-scale Convolutions with Additive Residuals
         for i in range(self.num_layers):
             x_in = x
@@ -104,7 +106,11 @@ class TAGCN_EdgeAugmented(nn.Module):
             x = F.relu(x)
             x = x + x_in
             x = F.dropout(x, p=self.dropout, training=self.training)
+            if self.use_jk:
+                layer_outputs.append(x)
 
+        if self.use_jk:
+            return torch.cat(layer_outputs, dim=-1)
         return x
 
 
@@ -119,13 +125,21 @@ class GraphEncoder(nn.Module):
         num_layers=3,
         dropout=0.1,
         norm_type='graph',
-        use_dual_pool=False,      # Default to Mean-Only (Our 40.23% Champion!)
-        train_eps=False,          # NEW: Learnable epsilon in GINE
-        use_input_mlp=False       # NEW: 2-layer MLP input projection
+        use_dual_pool=False,      # Default to Mean-Only (Our Champion!)
+        train_eps=False,          # Learnable epsilon in GINE
+        use_input_mlp=False,      # 2-layer MLP input projection
+        use_jk=False              # NEW: Jumping Knowledge (JK-Net)
     ):
         super(GraphEncoder, self).__init__()
         self.gnn_type = gnn_type
         self.use_dual_pool = use_dual_pool
+        self.use_jk = use_jk
+        self.num_layers = num_layers
+
+        # Effective node dimension after pooling:
+        # If Jumping Knowledge is enabled, all layers are concatenated along features
+        effective_dim = (hidden_dim * num_layers) if use_jk else hidden_dim
+        in_dim = effective_dim * 2 if use_dual_pool else effective_dim
 
         # 1. Custom TAGCN Branch Handling
         if gnn_type == 'TAGCN':
@@ -136,9 +150,9 @@ class GraphEncoder(nn.Module):
                 num_layers=num_layers,
                 dropout=dropout,
                 K_hops=2,
-                use_input_mlp=use_input_mlp
+                use_input_mlp=use_input_mlp,
+                use_jk=use_jk
             )
-            in_dim = hidden_dim * 2 if use_dual_pool else hidden_dim
             self.projector = nn.Sequential(
                 nn.Linear(in_dim, proj_feat_dim),
                 nn.BatchNorm1d(proj_feat_dim)
@@ -186,7 +200,6 @@ class GraphEncoder(nn.Module):
                     nn.ReLU(),
                     nn.Linear(hidden_dim, hidden_dim)
                 )
-                # Pass train_eps to GINEConv (trainable epsilon scalar)
                 self.layers.append(GINEConv(nn_mlp, edge_dim=hidden_dim, train_eps=train_eps))
             elif gnn_type == 'GATv2':
                 self.layers.append(GATv2Conv(hidden_dim, hidden_dim, heads=4, concat=False, edge_dim=hidden_dim))
@@ -210,7 +223,6 @@ class GraphEncoder(nn.Module):
             elif norm_type == 'batch':
                 self.norms.append(nn.BatchNorm1d(hidden_dim))
 
-        in_dim = hidden_dim * 2 if use_dual_pool else hidden_dim
         self.projector = nn.Sequential(
             nn.Linear(in_dim, proj_feat_dim),
             nn.BatchNorm1d(proj_feat_dim)
@@ -232,6 +244,8 @@ class GraphEncoder(nn.Module):
         x = self.node_encoder(x)
         edge_attr = self.edge_encoder(edge_attr)
 
+        layer_outputs = []
+
         for i, layer in enumerate(self.layers):
             x_in = x
             if self.gnn_type in ['GINE', 'GATv2']:
@@ -243,9 +257,18 @@ class GraphEncoder(nn.Module):
             x = F.relu(x)
             x = x + x_in
 
+            if self.use_jk:
+                layer_outputs.append(x)
+
+        # If Jumping Knowledge is enabled, concatenate all hop representations
+        if self.use_jk:
+            x_final = torch.cat(layer_outputs, dim=-1)
+        else:
+            x_final = x
+
         pooled = torch.cat([
-            global_mean_pool(x, batch),
-            global_max_pool(x, batch)
-        ], dim=-1) if self.use_dual_pool else global_mean_pool(x, batch)
+            global_mean_pool(x_final, batch),
+            global_max_pool(x_final, batch)
+        ], dim=-1) if self.use_dual_pool else global_mean_pool(x_final, batch)
 
         return self.projector(pooled)

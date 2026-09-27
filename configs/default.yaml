@@ -31,6 +31,7 @@ model:
   use_dual_pool: false          # Dual-Pooling [Mean || Max] Readout (Xu et al., ICLR 2019)
   train_eps: false              # Options: Trainable epsilon in GINE
   use_input_mlp: false          # Options: 2-layer non-linear input MLP
+  use_jk: false                 # Options: Jumping Knowledge (JK-Net)
   fusion_type: "dual_gate"      # Options: 'dual_gate', 'concat', 'add'
   modality_dropout: 0.0         # Options: 0.0 (off) or 0.15 (on)
   fsl_method: "protonet"        # Options: 'protonet', 'matching'
