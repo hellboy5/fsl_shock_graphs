@@ -74,19 +74,36 @@ def run_training(cfg, device):
     # Setup Model
     model = MultimodalFewShotNetwork(cfg).to(device)
 
-    # 1. AdamW Optimizer (Loshchilov & Hutter, ICLR 2019)
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay
-    )
-
-    # 2. Cosine Annealing Schedule (Smooth decay to 1e-6 floor)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=cfg.training.epochs,
-        eta_min=1e-6
-    )
+    # Modality-Specific Optimizer & Scheduling
+    if cfg.model.modality == 'vision':
+        # SGD with Nesterov momentum (MetaOptNet / TADAM standard for ResNet-12)
+        lr = 0.1 if cfg.training.lr == 0.001 else cfg.training.lr
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=cfg.training.weight_decay,
+            nesterov=True
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.training.epochs,
+            eta_min=1e-5
+        )
+        print(f"--> [Vision Optimizer] SGD with Nesterov momentum (lr={lr}, momentum=0.9, weight_decay={cfg.training.weight_decay})")
+    else:
+        # AdamW for GNN (preserves champion graph configuration)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=cfg.training.lr,
+            weight_decay=cfg.training.weight_decay
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.training.epochs,
+            eta_min=1e-6
+        )
+        print(f"--> [AdamW Optimizer] lr={cfg.training.lr}, weight_decay={cfg.training.weight_decay}")
 
     targets = torch.arange(n_way).repeat_interleave(n_query).long().to(device)
     best_val_acc = 0.0
@@ -105,7 +122,7 @@ def run_training(cfg, device):
             loss = F.cross_entropy(logits, targets)
             loss.backward()
 
-            # 3. Gradient Clipping (max_norm=1.0)
+            # Gradient Clipping (max_norm=1.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
