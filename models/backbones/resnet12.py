@@ -8,28 +8,39 @@ class DropBlock(nn.Module):
     """
     Vectorized, GPU-optimized DropBlock (Ghiasi et al., NeurIPS 2018).
     
-    Replaces slow CPU-synchronized tensor indexing with native 2D MaxPool dilation.
-    Mathematically identical to standard DropBlock while remaining fully robust
-    against zero-size tensor indexing crashes on small batch sizes.
+    Correctly calculates gamma scaled by the block area to drop an expected
+    fraction (1.0 - keep_prob) of spatial activations, matching the official
+    implementations in MetaOptNet, DeepEMD, and FRN.
     """
     def __init__(self, block_size: int = 5):
         super(DropBlock, self).__init__()
         self.block_size = block_size
 
-    def forward(self, x: torch.Tensor, gamma: float = 0.0) -> torch.Tensor:
-        if not self.training or gamma <= 0.0:
+    def forward(self, x: torch.Tensor, keep_prob: float = 0.9) -> torch.Tensor:
+        if not self.training or keep_prob >= 1.0:
             return x
 
         batch_size, channels, height, width = x.shape
 
-        # 1. Sample Bernoulli drop seeds directly on the target GPU
+        # Bound block size to feature map spatial dimensions
+        real_block_size = min(self.block_size, height, width)
+
+        # Standard DropBlock formula: scale gamma down by block area
+        gamma = (
+            (1.0 - keep_prob)
+            / (real_block_size ** 2)
+            * (height * width)
+            / ((height - real_block_size + 1) * (width - real_block_size + 1))
+        )
+
+        # 1. Sample Bernoulli drop seeds directly on target GPU
         mask = (torch.rand(batch_size, 1, height, width, device=x.device) < gamma).float()
 
-        # 2. Expand seed points into block_size x block_size square drop zones
-        padding = self.block_size // 2
+        # 2. Expand seed points into real_block_size x real_block_size square drop zones
+        padding = real_block_size // 2
         block_mask = 1.0 - F.max_pool2d(
             mask,
-            kernel_size=self.block_size,
+            kernel_size=real_block_size,
             stride=1,
             padding=padding
         )
@@ -88,16 +99,15 @@ class BasicBlock(nn.Module):
         out = self.conv3(out)
         out = self.bn3(out)
 
-        # Apply residual addition
+        # Residual addition followed by activation
         out = out + residual
         out = self.relu(out)
-        out = self.maxpool(out)
 
-        # DropBlock applied after pooling
+        # DropBlock applied BEFORE maxpool while spatial resolution is larger (10x10 in Block 4)
         if self.keep_prob < 1.0:
-            gamma = (1.0 - self.keep_prob)
-            out = self.dropblock(out, gamma=gamma)
+            out = self.dropblock(out, keep_prob=self.keep_prob)
 
+        out = self.maxpool(out)
         return out
 
 
