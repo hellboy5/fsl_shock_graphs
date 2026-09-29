@@ -48,6 +48,7 @@ training:
   scheduler: "cosine"           # Options: 'cosine', 'multistep'
   milestones: [40, 70, 90]      # Step decay epochs when scheduler='multistep'
   label_smoothing: 0.0          # Set to 0.1 for label smoothing regularization
+  accum_steps: 1
   weight_decay: 0.0005
   save_dir: "experiments"
   num_workers: 4
