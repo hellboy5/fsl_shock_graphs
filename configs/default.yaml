@@ -21,7 +21,7 @@ task:
 # Model Architecture Configuration
 model:
   modality: "multimodal"        # Options: 'vision', 'graph', 'multimodal'
-  hidden_dim: 128
+  graph_proj_dim: null
   node_feat_dim: 11
   edge_feat_dim: 14
   num_layers: 3
@@ -36,13 +36,18 @@ model:
   modality_dropout: 0.0         # Options: 0.0 (off) or 0.15 (on)
   fsl_method: "protonet"        # Options: 'protonet', 'matching'
   distance_metric: "cosine"     # Options: 'cosine', 'euclidean'
+  scale: 10.0                   # Options: tau parameter 
   learnable_scale: false        # Options: Learnable inverse temperature (1/tau)
 
 # Training Hyperparameters
 training:
   epochs: 100
-  lr: 0.001
-  weight_decay: 0.0005          # Standard AdamW decoupled weight decay
+  lr: 0.001                     # Automatically upgraded to 0.1 for SGD in train.py
+  optimizer: "auto"             # Options: 'auto', 'sgd', 'adamw'
+  scheduler: "cosine"           # Options: 'cosine', 'multistep'
+  milestones: [40, 70, 90]      # Step decay epochs when scheduler='multistep'
+  label_smoothing: 0.0          # Set to 0.1 for label smoothing regularization
+  weight_decay: 0.0005
   save_dir: "experiments"
   num_workers: 4
 
