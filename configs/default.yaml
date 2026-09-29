@@ -21,6 +21,7 @@ task:
 # Model Architecture Configuration
 model:
   modality: "multimodal"        # Options: 'vision', 'graph', 'multimodal'
+  graph_hidden_dim: 128
   graph_proj_dim: null
   node_feat_dim: 11
   edge_feat_dim: 14
