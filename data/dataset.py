@@ -1,7 +1,7 @@
 # data/dataset.py
 import os
 import torch
-from torch_geometric.data import Dataset
+from torch_geometric.data import Dataset, Data
 from PIL import Image
 
 
@@ -133,11 +133,14 @@ class MultimodalFSLDataset(Dataset):
         sample = self.samples[idx]
         
         # --- A. Load Graph Data ---
-        data = torch.load(sample['graph_path'], weights_only=False)
-        data.y = torch.tensor([sample['class_idx']], dtype=torch.long)
-        
-        if self.graph_transform is not None:
-            data = self.graph_transform(data)
+        if self.modality in ['multimodal', 'graph']:
+            data = torch.load(sample['graph_path'], weights_only=False)
+            data.y = torch.tensor([sample['class_idx']], dtype=torch.long)
+            if self.graph_transform is not None:
+                data = self.graph_transform(data)
+        else:
+            # Vision-only bypasses reading graph .pt from disk
+            data = Data(y=torch.tensor([sample['class_idx']], dtype=torch.long))
             
         # --- B. Load Vision Data ---
         if self.modality in ['multimodal', 'vision']:

@@ -11,7 +11,7 @@ checkpoint_path: null           # Added at root to support main.py eval routing
 
 # Few-Shot Task Settings
 task:
-  n_way: 5
+  n_way: 15
   n_shot: 1
   n_query: 15
   train_episodes: 200
@@ -45,10 +45,6 @@ training:
   epochs: 100
   lr: 0.001                     # Automatically upgraded to 0.1 for SGD in train.py
   optimizer: "auto"             # Options: 'auto', 'sgd', 'adamw'
-  scheduler: "cosine"           # Options: 'cosine', 'multistep'
-  milestones: [40, 70, 90]      # Step decay epochs when scheduler='multistep'
-  label_smoothing: 0.0          # Set to 0.1 for label smoothing regularization
-  accum_steps: 1
   weight_decay: 0.0005
   save_dir: "experiments"
   num_workers: 4
