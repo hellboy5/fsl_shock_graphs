@@ -1,6 +1,7 @@
 # Python environments
 __pycache__/
 *.py[cod]
+*$py.class
 .venv/
 venv/
 
@@ -10,6 +11,20 @@ data/**/*.pth
 experiments/
 *.pth
 *.pt
+*.ckpt
+*.bin
+
+# Preserve directory skeletons
+!checkpoints/**/.gitkeep
+
+# SLURM Logs and Cluster Outputs
+logs/
+*.out
+*.err
+
+# Hydra & Run Outputs
+.hydra/
+outputs/
 
 # OS and IDEs
 .DS_Store
