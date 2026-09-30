@@ -27,19 +27,14 @@ class MultimodalFewShotNetwork(nn.Module):
 
     # --- 2. Graph Pathway ---
     if self.modality in ['graph', 'multimodal']:
-      # Internal message-passing width (locked to champion 128D)
       g_hidden_dim = getattr(cfg.model, 'graph_hidden_dim', 128)
-
-      # Output projection dimension: graph_proj_dim if set, otherwise matches g_hidden_dim
-      g_proj_dim = (
-          getattr(cfg.model, 'graph_proj_dim', None) or g_hidden_dim
-      )
+      g_proj_dim = getattr(cfg.model, 'graph_proj_dim', None) or g_hidden_dim
 
       self.graph_encoder = GraphEncoder(
           node_feat_dim=cfg.model.node_feat_dim,
           edge_feat_dim=cfg.model.edge_feat_dim,
-          hidden_dim=g_hidden_dim,  # Convolutions run at graph_hidden_dim (128D)
-          proj_feat_dim=g_proj_dim,  # Output projected to g_proj_dim (128D or 640D)
+          hidden_dim=g_hidden_dim,
+          proj_feat_dim=g_proj_dim,
           gnn_type=cfg.model.gnn_type,
           num_layers=cfg.model.num_layers,
           dropout=cfg.model.dropout,
@@ -66,28 +61,61 @@ class MultimodalFewShotNetwork(nn.Module):
         learnable_scale=getattr(cfg.model, 'learnable_scale', False),
     )
 
+    # --- 5. Pretrained Checkpoint Loading & Freezing Hook ---
+    v_ckpt = getattr(cfg.model, 'vision_checkpoint', None)
+    if self.modality == 'multimodal' and v_ckpt:
+      self._load_submodule(self.vision_encoder, v_ckpt, 'vision_encoder')
+      if getattr(cfg.model, 'freeze_vision', False):
+        for p in self.vision_encoder.parameters():
+          p.requires_grad = False
+        print('--> [MultimodalNetwork] Vision encoder frozen.')
+
+    g_ckpt = getattr(cfg.model, 'graph_checkpoint', None)
+    if self.modality == 'multimodal' and g_ckpt:
+      self._load_submodule(self.graph_encoder, g_ckpt, 'graph_encoder')
+      if getattr(cfg.model, 'freeze_graph', False):
+        for p in self.graph_encoder.parameters():
+          p.requires_grad = False
+        print('--> [MultimodalNetwork] Graph encoder frozen.')
+
+  def _load_submodule(self, module, path, target_name):
+    print(
+        f'--> [MultimodalNetwork] Loading {target_name} weights from: {path}'
+    )
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    state = ckpt.get('model_state_dict', ckpt)
+    target_dict = module.state_dict()
+    matched = {}
+
+    for k, v in state.items():
+      # Strip prefix if loading from another multimodal checkpoint
+      clean_k = k
+      for prefix in [f'{target_name}.', 'model.', 'module.']:
+        if clean_k.startswith(prefix):
+          clean_k = clean_k[len(prefix) :]
+      if clean_k in target_dict and v.shape == target_dict[clean_k].shape:
+        matched[clean_k] = v
+
+    target_dict.update(matched)
+    module.load_state_dict(target_dict)
+    print(
+        f'--> [MultimodalNetwork] Loaded {len(matched)} / {len(target_dict)}'
+        f' layers for {target_name}.'
+    )
+
   def forward(self, vision_batch, graph_batch, n_way, k_shot):
-    """Forward pass for an entire FSL episode."""
-    # --- A. Feature Extraction & Modality Routing ---
     if self.modality == 'vision':
       features = self.vision_encoder(vision_batch)
-
     elif self.modality == 'graph':
       features = self.graph_encoder(graph_batch)
-
     elif self.modality == 'multimodal':
       v_feat = self.vision_encoder(vision_batch)
       g_feat = self.graph_encoder(graph_batch)
       features = self.fusion(v_feat, g_feat)
-
     else:
       raise ValueError(f'Unknown modality configured: {self.modality}')
 
-    # --- B. Episodic Splitting ---
     k_total = n_way * k_shot
     support_features = features[:k_total]
     query_features = features[k_total:]
-
-    # --- C. Prototypical Classification ---
-    logits = self.classifier(support_features, query_features, n_way, k_shot)
-    return logits
+    return self.classifier(support_features, query_features, n_way, k_shot)

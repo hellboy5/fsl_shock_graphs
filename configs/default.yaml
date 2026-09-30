@@ -21,8 +21,12 @@ task:
 # Model Architecture Configuration
 model:
   modality: "multimodal"        # Options: 'vision', 'graph', 'multimodal'
+  vision_checkpoint: null       # Path to trained vision checkpoint
+  graph_checkpoint: null        # Path to trained graph checkpoint
+  freeze_vision: false          # Set true to freeze visual stream
+  freeze_graph: false           # Set true to freeze graph stream
   graph_hidden_dim: 128
-  graph_proj_dim: null
+  graph_proj_dim: 640
   node_feat_dim: 11
   edge_feat_dim: 14
   num_layers: 3

@@ -110,7 +110,7 @@ def run_training(cfg, device):
 
   model = MultimodalFewShotNetwork(cfg).to(device)
 
-  # Optimizer: SGD Nesterov for Vision, AdamW for Graph
+  # Optimizer: SGD Nesterov for Vision, AdamW for Graph and Fusion
   opt_type = getattr(cfg.training, 'optimizer', 'auto')
   use_sgd = (
       (opt_type == 'sgd')
@@ -140,8 +140,9 @@ def run_training(cfg, device):
         ' CosineAnnealingLR'
     )
   else:
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay,
     )
@@ -217,7 +218,8 @@ def run_training(cfg, device):
     print(
         f'Epoch {epoch:03d} | Train Loss: {np.mean(train_losses):.4f} | Train'
         f' Acc: {np.mean(train_accs):.2f}% | Val Acc: {mean_val_acc:.2f}% | LR:'
-        f' {current_lr:.6f}'
+        f' {current_lr:.6f}',
+        flush=True,
     )
 
     if mean_val_acc > best_val_acc:
@@ -231,6 +233,6 @@ def run_training(cfg, device):
           },
           os.path.join(save_dir, 'checkpoints', 'best_model.pth'),
       )
-      print(f'  -> New Best Model Saved! ({best_val_acc:.2f}%)')
+      print(f'  -> New Best Model Saved! ({best_val_acc:.2f}%)', flush=True)
 
     scheduler.step()
