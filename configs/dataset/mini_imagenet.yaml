@@ -16,6 +16,7 @@ graph:
   # -------------------------------------------------------------------------
   use_coarse: true
   image_size: 84
+  use_graph_local_norm: false
   node_feat_dim: 11
   edge_feat_dim: 14
 
