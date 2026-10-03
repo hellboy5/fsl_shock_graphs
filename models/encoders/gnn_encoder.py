@@ -202,7 +202,7 @@ class GraphEncoder(nn.Module):
     self.register_buffer(
         'deg_histogram',
         torch.tensor(
-            [120, 8500, 3200, 14000, 1800, 450, 120, 20, 5], dtype=torch.float
+            [0, 31275978, 254592, 26943186, 2124], dtype=torch.float
         ),
     )
 
