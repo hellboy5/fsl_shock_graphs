@@ -16,7 +16,13 @@ from torch_geometric.nn import (
     global_max_pool,
     global_mean_pool,
 )
-from torch_geometric.nn.aggr import GraphMultisetTransformer, SoftmaxAggregation
+from torch_geometric.nn.aggr import (
+    DeepSetsAggregation,
+    GraphMultisetTransformer,
+    MedianAggregation,
+    MultiAggregation,
+    SoftmaxAggregation,
+)
 
 try:
   from torch_scatter import scatter_add
@@ -27,7 +33,10 @@ except ImportError:
 
 
 class TAGCN_EdgeAugmented(nn.Module):
-  """Edge-Augmented TAGCN (Narayanan et al., ICCV 2021)."""
+  """Edge-Augmented TAGCN (Narayanan et al., ICCV 2021).
+
+  Fuses node and edge representations before applying multi-hop TAGConv.
+  """
 
   def __init__(
       self,
@@ -118,16 +127,14 @@ class TAGCN_EdgeAugmented(nn.Module):
       if self.use_jk:
         layer_outputs.append(x)
 
-    if self.use_jk:
-      return torch.cat(layer_outputs, dim=-1)
-    return x
+    return torch.cat(layer_outputs, dim=-1) if self.use_jk else x
 
 
 class GraphEncoder(nn.Module):
   """Modular GNN Backbone for Shock Graphs.
 
-  Supports GINE, GPS, PNA, GATv2, ResGated, and TAGCN. Supports 6 dynamic
-  pooling methods via `pooling_method`.
+  Supports GINE, GPS, PNA, GATv2, ResGated, and TAGCN. Routes across 7 pooling
+  and readout paradigms via `pooling_method`.
   """
 
   def __init__(
@@ -153,15 +160,18 @@ class GraphEncoder(nn.Module):
     self.hidden_dim = hidden_dim
     self.pooling_method = str(pooling_method).lower()
 
+    # Dimension after multi-layer concatenation (JK-Net)
     effective_dim = (hidden_dim * num_layers) if use_jk else hidden_dim
 
-    # dual_pool concatenates [Mean || Max], doubling feature dimension
+    # Determine input projection dimension based on readout operator
     if self.pooling_method in ["dual_pool", "mean_max"]:
       in_dim = effective_dim * 2
+    elif self.pooling_method == "multi_moment":
+      in_dim = effective_dim * 4  # Concatenates [Mean || Std || Min || Max]
     else:
       in_dim = effective_dim
 
-    # 1. TAGCN Branch
+    # 1. TAGCN Path
     if gnn_type == "TAGCN":
       self.tagcn = TAGCN_EdgeAugmented(
           node_feat_dim=node_feat_dim,
@@ -179,7 +189,7 @@ class GraphEncoder(nn.Module):
       )
       return
 
-    # 2. Input Projections
+    # 2. Input Encoders (Node & Edge Projections)
     if use_input_mlp:
       self.node_encoder = nn.Sequential(
           nn.Linear(node_feat_dim, hidden_dim),
@@ -209,13 +219,16 @@ class GraphEncoder(nn.Module):
           nn.ReLU(),
       )
 
-    # 3. Message Passing Layers
+    # 3. GNN Message Passing Convolution Layers
     self.layers = nn.ModuleList()
     self.norms = nn.ModuleList()
 
+    # Prior degree histogram for PNA architecture
     self.register_buffer(
         "deg_histogram",
-        torch.tensor([0, 31275978, 254592, 26943186, 2124], dtype=torch.float),
+        torch.tensor(
+            [0, 31275978, 254592, 26943186, 2124], dtype=torch.float
+        ),
     )
 
     for _ in range(num_layers):
@@ -228,6 +241,7 @@ class GraphEncoder(nn.Module):
         self.layers.append(
             GINEConv(nn_mlp, edge_dim=hidden_dim, train_eps=train_eps)
         )
+
       elif gnn_type == "GPS":
         local_conv = GINEConv(
             nn.Sequential(
@@ -247,15 +261,14 @@ class GraphEncoder(nn.Module):
                 attn_type="multihead",
             )
         )
+
       elif gnn_type == "PNA":
-        aggregators = ["mean", "min", "max", "std"]
-        scalers = ["identity", "amplification", "attenuation"]
         self.layers.append(
             PNAConv(
                 in_channels=hidden_dim,
                 out_channels=hidden_dim,
-                aggregators=aggregators,
-                scalers=scalers,
+                aggregators=["mean", "min", "max", "std"],
+                scalers=["identity", "amplification", "attenuation"],
                 deg=self.deg_histogram,
                 edge_dim=hidden_dim,
                 towers=4,
@@ -264,6 +277,7 @@ class GraphEncoder(nn.Module):
                 divide_input=False,
             )
         )
+
       elif gnn_type == "GATv2":
         self.layers.append(
             GATv2Conv(
@@ -274,8 +288,10 @@ class GraphEncoder(nn.Module):
                 edge_dim=hidden_dim,
             )
         )
+
       elif gnn_type == "ResGated":
         self.layers.append(ResGatedGraphConv(hidden_dim, hidden_dim))
+
       else:
         raise ValueError(f"Unknown GNN type: {gnn_type}")
 
@@ -286,57 +302,95 @@ class GraphEncoder(nn.Module):
       elif norm_type == "batch":
         self.norms.append(nn.BatchNorm1d(hidden_dim))
 
-    # 4. Pooling Modules Setup
+    # 4. Pooling / Readout Setup
     self._setup_pooling_modules(effective_dim)
 
-    # 5. Output Projection Head
+    # 5. Output Projection Head to Metric Space (640D)
     self.projector = nn.Sequential(
         nn.Linear(in_dim, proj_feat_dim), nn.BatchNorm1d(proj_feat_dim)
     )
 
   def _setup_pooling_modules(self, effective_dim):
-    if self.pooling_method == "global_attention":
+    """Initializes PyG aggregation and pooling modules without hardcoded node sizes."""
+    if self.pooling_method == "median":
+      # L1-Median robust order statistics against outlier noise
+      self.pool_op = MedianAggregation()
+
+    elif self.pooling_method == "multi_moment":
+      # Concatenates 4 moments: [mean, std, min, max]
+      self.pool_op = MultiAggregation(
+          aggrs=["mean", "std", "min", "max"], mode="cat"
+      )
+
+    elif self.pooling_method == "global_attention":
+      # 2-layer MLP soft saliency gate (Li et al.)
       gate_nn = nn.Sequential(
           nn.Linear(effective_dim, effective_dim // 2),
           nn.ReLU(),
           nn.Linear(effective_dim // 2, 1),
       )
       self.pool_op = GlobalAttention(gate_nn=gate_nn)
+
     elif self.pooling_method == "softmax":
+      # Learnable inverse-temperature continuous aggregation
       self.pool_op = SoftmaxAggregation(learn=True)
-    elif self.pooling_method == "gmt":
-      self.pool_op = GraphMultisetTransformer(
-          in_channels=effective_dim,
-          hidden_channels=effective_dim,
-          out_channels=effective_dim,
-          num_nodes=2000,
-          num_heads=4,
+
+    elif self.pooling_method == "deep_sets":
+      # Universal Set Function Approximator: rho(sum(phi(x)))
+      phi = nn.Sequential(
+          nn.Linear(effective_dim, effective_dim),
+          nn.ReLU(),
+          nn.Linear(effective_dim, effective_dim),
       )
+      rho = nn.Sequential(nn.Linear(effective_dim, effective_dim), nn.ReLU())
+      self.pool_op = DeepSetsAggregation(local_nn=phi, global_nn=rho)
+
+    elif self.pooling_method == "gmt":
+      # Native PyG GraphMultisetTransformer (channels=dim, k=4 representative seeds, heads=2)
+      # Completely size-agnostic: handles 5 nodes to 1,600+ nodes dynamically!
+      self.pool_op = GraphMultisetTransformer(
+          channels=effective_dim, k=4, num_encoder_blocks=1, heads=2
+      )
+
     elif self.pooling_method == "sag_pool":
+      # Self-Attention Graph Pooling: prunes bottom 30% of noise nodes
       self.sag = SAGPooling(in_channels=effective_dim, ratio=0.7)
 
   def _apply_pooling(self, x_final, edge_index, edge_attr, batch):
+    """Dispatches the configured pooling method to produce a single graph vector."""
     if self.pooling_method == "mean":
       return global_mean_pool(x_final, batch)
+
     elif self.pooling_method in ["dual_pool", "mean_max"]:
       p_mean = global_mean_pool(x_final, batch)
       p_max = global_max_pool(x_final, batch)
       return torch.cat([p_mean, p_max], dim=-1)
+
+    elif self.pooling_method in [
+        "median",
+        "multi_moment",
+        "softmax",
+        "deep_sets",
+        "gmt",
+    ]:
+      # PyG Aggregation operators expect (x, index=batch)
+      return self.pool_op(x_final, index=batch)
+
     elif self.pooling_method == "global_attention":
       return self.pool_op(x_final, batch)
-    elif self.pooling_method == "softmax":
-      return self.pool_op(x_final, index=batch)
-    elif self.pooling_method == "gmt":
-      return self.pool_op(x_final, index=batch)
+
     elif self.pooling_method == "sag_pool":
+      # Unpack 5 elements returned by PyG SAGPooling
       x_pruned, _, _, batch_pruned, _ = self.sag(
           x_final, edge_index, edge_attr=edge_attr, batch=batch
       )
       return global_mean_pool(x_pruned, batch_pruned)
+
     else:
       return global_mean_pool(x_final, batch)
 
   def forward(self, data):
+    # TAGCN Branch
     if self.gnn_type == "TAGCN":
       x_nodes = self.tagcn(data)
       pooled = self._apply_pooling(
@@ -344,6 +398,7 @@ class GraphEncoder(nn.Module):
       )
       return self.projector(pooled)
 
+    # Standard GNN Path
     x, edge_index, edge_attr, batch = (
         data.x,
         data.edge_index,
@@ -377,5 +432,7 @@ class GraphEncoder(nn.Module):
 
     x_final = torch.cat(layer_outputs, dim=-1) if self.use_jk else x
 
+    # Execute pooling
     pooled = self._apply_pooling(x_final, edge_index, edge_attr, batch)
+
     return self.projector(pooled)
