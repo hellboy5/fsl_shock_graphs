@@ -39,7 +39,7 @@ class MultimodalFewShotNetwork(nn.Module):
           num_layers=cfg.model.num_layers,
           dropout=cfg.model.dropout,
           norm_type=getattr(cfg.model, 'norm_type', 'graph'),
-          use_dual_pool=getattr(cfg.model, 'use_dual_pool', False),
+          pooling_method=getattr(cfg.model, 'pooling_method', 'mean'),
           train_eps=getattr(cfg.model, 'train_eps', False),
           use_input_mlp=getattr(cfg.model, 'use_input_mlp', False),
           use_jk=getattr(cfg.model, 'use_jk', False),
