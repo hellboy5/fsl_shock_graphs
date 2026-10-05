@@ -110,6 +110,39 @@ def run_training(cfg, device):
 
   model = MultimodalFewShotNetwork(cfg).to(device)
 
+  # --- Warm-Start Checkpoint Loading (Strategy 3 / Meta-Baseline) ---
+  ckpt_path = getattr(cfg, 'checkpoint_path', None) or getattr(
+      cfg.evaluation, 'checkpoint_path', None
+  )
+  if ckpt_path:
+    print(f'--> [Warm-Start] Loading pre-trained weights from: {ckpt_path}')
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    # Allow loading state_dict whether saved as full model or encoder submodule
+    model_dict = model.state_dict()
+    matched_dict = {}
+    for k, v in state_dict.items():
+      if k in model_dict and v.shape == model_dict[k].shape:
+        matched_dict[k] = v
+      elif (
+          f'graph_encoder.{k}' in model_dict
+          and v.shape == model_dict[f'graph_encoder.{k}'].shape
+      ):
+        matched_dict[f'graph_encoder.{k}'] = v
+      elif (
+          k.replace('graph_encoder.', '') in model_dict
+          and v.shape == model_dict[k.replace('graph_encoder.', '')].shape
+      ):
+        matched_dict[k.replace('graph_encoder.', '')] = v
+
+    model_dict.update(matched_dict)
+    model.load_state_dict(model_dict, strict=False)
+    print(
+        f'--> [Warm-Start] Successfully loaded {len(matched_dict)} /'
+        f' {len(model_dict)} tensors.'
+    )
+
   # Optimizer: SGD Nesterov for Vision, AdamW for Graph and Fusion
   opt_type = getattr(cfg.training, 'optimizer', 'auto')
   use_sgd = (
