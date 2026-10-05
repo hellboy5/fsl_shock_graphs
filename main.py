@@ -1,23 +1,35 @@
+# main.py
 import hydra
+from pretrain import run_pretraining
 import torch
 from utils.helpers import seed_everything
-from train import run_training
-from eval import run_evaluation
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="default")
 def main(cfg):
-    # 1. Global Setup
-    seed_everything(cfg.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 2. Modality/Experiment Routing
-    if cfg.mode == 'train':
-        print(f"Starting Training Run for Modality: {cfg.model.modality}")
-        run_training(cfg, device)
-        
-    elif cfg.mode == 'eval':
-        print(f"Starting Evaluation for Checkpoint: {cfg.checkpoint_path}")
-        run_evaluation(cfg, device)
+  # 1. Global Setup
+  seed_everything(cfg.seed)
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+  # 2. Routing
+  if cfg.mode == "train":
+    from train import run_training
+
+    print(f"Starting Episodic Training Run for Modality: {cfg.model.modality}")
+    run_training(cfg, device)
+
+  elif cfg.mode == "pretrain":
+    print(
+        f"Starting 64-Class Supervised Pre-Training for: {cfg.model.modality}"
+    )
+    run_pretraining(cfg, device)
+
+  elif cfg.mode == "eval":
+    from eval import run_evaluation
+
+    print(f"Starting Evaluation for Checkpoint: {cfg.checkpoint_path}")
+    run_evaluation(cfg, device)
+
 
 if __name__ == "__main__":
-    main()
+  main()

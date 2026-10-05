@@ -47,6 +47,7 @@ model:
 # Training Hyperparameters
 training:
   epochs: 100
+  batch_size: 256
   lr: 0.001                     # Automatically upgraded to 0.1 for SGD in train.py
   optimizer: "auto"             # Options: 'auto', 'sgd', 'adamw'
   weight_decay: 0.0005
