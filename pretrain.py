@@ -1,10 +1,7 @@
 # pretrain.py
 import os
+import math
 import random
-from data.dataset import MultimodalFSLDataset
-from data.samplers import EpisodicBatchSampler
-from data.transforms import get_graph_transform
-from models.encoders.gnn_encoder import GraphEncoder
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +11,11 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
+from data.dataset import MultimodalFSLDataset
+from data.samplers import EpisodicBatchSampler
+from data.transforms import get_graph_transform
+from models.encoders.gnn_encoder import GraphEncoder
+
 
 def seed_worker(worker_id):
   worker_seed = torch.initial_seed() % (2**32)
@@ -21,7 +23,7 @@ def seed_worker(worker_id):
   random.seed(worker_seed)
 
 
-# 1. Mini-Batch Collate Function for Standard Pre-Training (64-Class CE)
+# 1. Mini-Batch Collate Function for Training (64-Class CE)
 def pretrain_graph_collate(data_list):
   targets = torch.tensor([d.y.item() for d in data_list], dtype=torch.long)
   batched_graphs = Batch.from_data_list(data_list)
@@ -33,7 +35,27 @@ def val_episodic_collate(data_list):
   return Batch.from_data_list(data_list)
 
 
-# 3. Model Wrapper (Backbone + 64-Class Linear Head)
+# 3. Normalized Cosine Linear Head (Baseline++ Formulation)
+class NormalizedLinear(nn.Module):
+  """Enforces cosine/angular classification during supervised pre-training."""
+
+  def __init__(self, in_features, out_features, scale=10.0):
+    super(NormalizedLinear, self).__init__()
+    self.in_features = in_features
+    self.out_features = out_features
+    self.scale = scale
+    self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+    nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+  def forward(self, x):
+    # L2 normalize both the incoming features and the class weight vectors
+    x_norm = F.normalize(x, p=2, dim=-1)
+    w_norm = F.normalize(self.weight, p=2, dim=-1)
+    # Return scaled cosine similarity logits
+    return self.scale * F.linear(x_norm, w_norm)
+
+
+# 4. Model Wrapper
 class GraphClassificationModel(nn.Module):
 
   def __init__(self, cfg, num_classes=64):
@@ -55,7 +77,8 @@ class GraphClassificationModel(nn.Module):
         use_input_mlp=getattr(cfg.model, "use_input_mlp", True),
         use_jk=getattr(cfg.model, "use_jk", True),
     )
-    self.classifier = nn.Linear(g_proj_dim, num_classes)
+    # Cosine Classifier enforces angular manifold during pre-training
+    self.classifier = NormalizedLinear(g_proj_dim, num_classes, scale=10.0)
 
   def forward(self, graph_batch):
     z = self.encoder(graph_batch)  # [B, 640]
@@ -63,7 +86,7 @@ class GraphClassificationModel(nn.Module):
     return logits, z
 
 
-# 4. Novel-Class Validation Step (5-Way 1-Shot Cosine Matching)
+# 5. Novel-Class Validation Step (5-Way 1-Shot Cosine Matching)
 def validate_few_shot(
     encoder, val_loader, n_way, n_query, eval_episodes, device
 ):
@@ -82,8 +105,8 @@ def validate_few_shot(
       embeddings = encoder(graph_batch)  # [Total_Samples, 640]
       embeddings = F.normalize(embeddings, p=2, dim=-1)
 
-      n_support = n_way * 1  # 1-shot
-      prototypes = embeddings[:n_support]  # [5, 640]
+      n_support = n_way * 1  # 5 support samples (1-shot)
+      prototypes = embeddings[:n_support]  #
       queries = embeddings[n_support:]  # [75, 640]
 
       # Cosine similarity scaled by 10.0
@@ -97,7 +120,7 @@ def validate_few_shot(
   return mean_acc, ci
 
 
-# 5. Main Pre-Training Function
+# 6. Main Pre-Training Function
 def run_pretraining(cfg, device):
   save_dir = cfg.training.save_dir
   os.makedirs(os.path.join(save_dir, "checkpoints"), exist_ok=True)
@@ -112,11 +135,11 @@ def run_pretraining(cfg, device):
   val_n_query = cfg.task.n_query
   val_episodes = int(getattr(cfg.task, "val_episodes", 200))
 
-  # 1. Enforce Un-Coarsened mode
+  # Enforce Un-Coarsened mode
   cfg.dataset.graph.use_coarse = False
   g_transform = get_graph_transform(cfg)
 
-  # 2. Build Datasets
+  # Datasets
   print("--> [Data] Loading Base Training Set (64 Classes, 383K Graphs)...")
   train_set = MultimodalFSLDataset(
       cfg.dataset,
@@ -126,9 +149,7 @@ def run_pretraining(cfg, device):
       graph_transform=g_transform,
   )
 
-  print(
-      "--> [Data] Loading Novel Validation Set (16 Classes, 5-Way 1-Shot)..."
-  )
+  print("--> [Data] Loading Novel Validation Set (16 Classes, 5-Way 1-Shot)...")
   val_set = MultimodalFSLDataset(
       cfg.dataset,
       modality="graph",
@@ -153,7 +174,7 @@ def run_pretraining(cfg, device):
       generator=g,
   )
 
-  # Episodic Sampler for Novel-Class Validation
+  # Episodic Sampler for Validation (Strictly 5-Way 1-Shot)
   val_sampler = EpisodicBatchSampler(
       val_set.labels,
       val_set.base_names,
@@ -170,10 +191,9 @@ def run_pretraining(cfg, device):
       pin_memory=True,
   )
 
-  # 3. Model Setup
   model = GraphClassificationModel(cfg, num_classes=64).to(device)
 
-  # 4. Adaptive Optimizer Setup: AdamW for GNNs, SGD fallback if specified
+  # Adaptive Optimizer Setup (AdamW defaults for GNNs)
   opt_type = getattr(cfg.training, "optimizer", "auto")
   use_sgd = (opt_type == "sgd") or (cfg.training.lr >= 0.05)
 
@@ -250,7 +270,7 @@ def run_pretraining(cfg, device):
 
     scheduler.step()
 
-    # 5. Novel-Class Validation Step
+    # 4. Validation step (Strict 5-Way 1-Shot)
     val_1shot, val_ci = validate_few_shot(
         model.encoder,
         val_loader,
@@ -270,7 +290,7 @@ def run_pretraining(cfg, device):
         f" {val_1shot:.2f}% ± {val_ci:.2f}% | LR: {current_lr:.6f}"
     )
 
-    # 6. Save Checkpoint When Transferability Peaks
+    # 5. Checkpoint Saving (Clean graph_encoder prefix matching MultimodalFewShotNetwork)
     if val_1shot > best_val_acc:
       best_val_acc = val_1shot
       ckpt_path = os.path.join(save_dir, "checkpoints", "best_model.pth")
@@ -291,6 +311,7 @@ def run_pretraining(cfg, device):
   print("\n" + "=" * 80)
   print(f"Pre-Training Complete! Peak Novel Val 1-Shot: {best_val_acc:.2f}%")
   print(
-      f"Best Model Saved to: {os.path.join(save_dir, 'checkpoints', 'best_model.pth')}"
+      f"Best Model Saved to:"
+      f" {os.path.join(save_dir, 'checkpoints', 'best_model.pth')}"
   )
   print("=" * 80)
