@@ -21,7 +21,7 @@ def seed_worker(worker_id):
   random.seed(worker_seed)
 
 
-# 1. Mini-Batch Collate Function for Training (64-Class CE)
+# 1. Mini-Batch Collate Function for Standard Pre-Training (64-Class CE)
 def pretrain_graph_collate(data_list):
   targets = torch.tensor([d.y.item() for d in data_list], dtype=torch.long)
   batched_graphs = Batch.from_data_list(data_list)
@@ -103,11 +103,10 @@ def run_pretraining(cfg, device):
   os.makedirs(os.path.join(save_dir, "checkpoints"), exist_ok=True)
 
   epochs = int(getattr(cfg.training, "epochs", 60))
-  batch_size = int(getattr(cfg.training, "batch_size", 256))
-  lr = float(getattr(cfg.training, "lr", 0.05))
-  weight_decay = float(getattr(cfg.training, "weight_decay", 0.0005))
+  batch_size = int(getattr(cfg.training, "batch_size", 128))
   num_workers = int(getattr(cfg.training, "num_workers", 4))
 
+  # Validation task parameters reused cleanly from cfg.task
   val_n_way = 5
   val_n_shot = 1
   val_n_query = cfg.task.n_query
@@ -141,6 +140,7 @@ def run_pretraining(cfg, device):
   g = torch.Generator()
   g.manual_seed(cfg.seed)
 
+  # Standard Mini-Batch DataLoader for Training (100% Data Exposure)
   train_loader = DataLoader(
       train_set,
       batch_size=batch_size,
@@ -153,6 +153,7 @@ def run_pretraining(cfg, device):
       generator=g,
   )
 
+  # Episodic Sampler for Novel-Class Validation
   val_sampler = EpisodicBatchSampler(
       val_set.labels,
       val_set.base_names,
@@ -169,21 +170,50 @@ def run_pretraining(cfg, device):
       pin_memory=True,
   )
 
-  # 3. Model & Optimizer Setup
+  # 3. Model Setup
   model = GraphClassificationModel(cfg, num_classes=64).to(device)
 
-  optimizer = optim.SGD(
-      model.parameters(),
-      lr=lr,
-      momentum=0.9,
-      weight_decay=weight_decay,
-      nesterov=True,
-  )
-  scheduler = optim.lr_scheduler.CosineAnnealingLR(
-      optimizer, T_max=epochs, eta_min=1e-5
-  )
-  criterion = nn.CrossEntropyLoss()
+  # 4. Adaptive Optimizer Setup: AdamW for GNNs, SGD fallback if specified
+  opt_type = getattr(cfg.training, "optimizer", "auto")
+  use_sgd = (opt_type == "sgd") or (cfg.training.lr >= 0.05)
 
+  if use_sgd:
+    lr = cfg.training.lr
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=lr,
+        momentum=0.9,
+        weight_decay=cfg.training.weight_decay,
+        nesterov=True,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-5
+    )
+    print(
+        f"--> [Pretrain Optimizer: SGD Nesterov] lr={lr}, momentum=0.9,"
+        f" weight_decay={cfg.training.weight_decay}"
+    )
+  else:
+    # GNN Gold Standard: AdamW with lr=0.001
+    lr = (
+        0.001
+        if (cfg.training.lr == 0.001 or opt_type == "auto")
+        else cfg.training.lr
+    )
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=float(getattr(cfg.training, "weight_decay", 0.0001)),
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
+    )
+    print(
+        f"--> [Pretrain Optimizer: AdamW] lr={lr},"
+        f" weight_decay={optimizer.param_groups[0]['weight_decay']}"
+    )
+
+  criterion = nn.CrossEntropyLoss()
   best_val_acc = 0.0
 
   print("\n" + "=" * 80)
@@ -220,7 +250,7 @@ def run_pretraining(cfg, device):
 
     scheduler.step()
 
-    # 4. Novel Validation Check
+    # 5. Novel-Class Validation Step
     val_1shot, val_ci = validate_few_shot(
         model.encoder,
         val_loader,
@@ -240,7 +270,7 @@ def run_pretraining(cfg, device):
         f" {val_1shot:.2f}% ± {val_ci:.2f}% | LR: {current_lr:.6f}"
     )
 
-    # 5. Checkpoint Saving (Clean graph_encoder prefix matching MultimodalFewShotNetwork)
+    # 6. Save Checkpoint When Transferability Peaks
     if val_1shot > best_val_acc:
       best_val_acc = val_1shot
       ckpt_path = os.path.join(save_dir, "checkpoints", "best_model.pth")
