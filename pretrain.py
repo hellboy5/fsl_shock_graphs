@@ -39,7 +39,7 @@ def val_episodic_collate(data_list):
 class NormalizedLinear(nn.Module):
   """Enforces cosine/angular classification during supervised pre-training."""
 
-  def __init__(self, in_features, out_features, scale=10.0):
+  def __init__(self, in_features, out_features, scale=16.0):
     super(NormalizedLinear, self).__init__()
     self.in_features = in_features
     self.out_features = out_features
@@ -78,7 +78,8 @@ class GraphClassificationModel(nn.Module):
         use_jk=getattr(cfg.model, "use_jk", True),
     )
     # Cosine Classifier enforces angular manifold during pre-training
-    self.classifier = NormalizedLinear(g_proj_dim, num_classes, scale=10.0)
+    scale = float(getattr(cfg.model, "scale", 16.0))
+    self.classifier = NormalizedLinear(g_proj_dim, num_classes, scale=scale)
 
   def forward(self, graph_batch):
     z = self.encoder(graph_batch)  # [B, 640]
@@ -233,7 +234,8 @@ def run_pretraining(cfg, device):
         f" weight_decay={optimizer.param_groups[0]['weight_decay']}"
     )
 
-  criterion = nn.CrossEntropyLoss()
+  smoothing = float(getattr(cfg.training, "label_smoothing", 0.1))
+  criterion = nn.CrossEntropyLoss(label_smoothing=smoothing)
   best_val_acc = 0.0
 
   print("\n" + "=" * 80)
