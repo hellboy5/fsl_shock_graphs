@@ -51,6 +51,7 @@ training:
   lr: 0.001                     # Automatically upgraded to 0.1 for SGD in train.py
   optimizer: "auto"             # Options: 'auto', 'sgd', 'adamw'
   weight_decay: 0.0005
+  label_smoothing: 0.0         # Options: 0.0 (off), 0.10, 0.15 (for pre-training)
   save_dir: "experiments"
   num_workers: 4
 
