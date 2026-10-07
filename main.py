@@ -3,7 +3,7 @@ import hydra
 from pretrain import run_pretraining
 import torch
 from utils.helpers import seed_everything
-
+from pretrain_multimodal import run_joint_pretraining
 
 @hydra.main(version_base=None, config_path="configs", config_name="default")
 def main(cfg):
@@ -23,7 +23,8 @@ def main(cfg):
         f"Starting 64-Class Supervised Pre-Training for: {cfg.model.modality}"
     )
     run_pretraining(cfg, device)
-
+  elif cfg.mode in ["pretrain_multimodal", "joint_pretrain"]:
+    run_joint_pretraining(cfg, device)
   elif cfg.mode == "eval":
     from eval import run_evaluation
 

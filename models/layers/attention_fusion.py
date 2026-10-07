@@ -300,3 +300,73 @@ def build_attention_fusion(fusion_type: str, dim: int = 640, **kwargs):
     return GatedCrossAttention(dim=dim, **kwargs)
   else:
     raise ValueError(f"Unknown attention fusion_type: {fusion_type}")
+
+# =============================================================================
+# Additional Unified Fusion Modules for Joint Pre-Training & Evaluation
+# =============================================================================
+class AsymmetricResidualProjection(nn.Module):
+  """Vision Anchor + Linear Graph Projection."""
+
+  def __init__(self, dim=640, dropout=0.1):
+    super().__init__()
+    self.proj_g = nn.Sequential(
+        nn.Linear(dim, dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim, dim),
+    )
+    self.ln = nn.LayerNorm(dim)
+
+  def forward(self, z_v, z_g):
+    base_v = z_v if z_v.dim() == 2 else z_v.mean(dim=1)
+    base_g = z_g if z_g.dim() == 2 else z_g.mean(dim=1)
+    return F.normalize(self.ln(base_v + self.proj_g(base_g)), p=2, dim=-1)
+
+
+class GatedResidualFusion(nn.Module):
+  """Vision Anchor + Channel-Wise Sigmoid Gated Graph Context."""
+
+  def __init__(self, dim=640, dropout=0.1):
+    super().__init__()
+    self.proj_g = nn.Sequential(
+        nn.Linear(dim, dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim, dim),
+    )
+    self.gate = nn.Sequential(
+        nn.Linear(dim * 2, dim // 2),
+        nn.ReLU(),
+        nn.Linear(dim // 2, dim),
+        nn.Sigmoid(),
+    )
+    self.ln = nn.LayerNorm(dim)
+
+  def forward(self, z_v, z_g):
+    base_v = z_v if z_v.dim() == 2 else z_v.mean(dim=1)
+    base_g = z_g if z_g.dim() == 2 else z_g.mean(dim=1)
+    g = self.gate(torch.cat([base_v, base_g], dim=-1))
+    delta = self.proj_g(base_g)
+    return F.normalize(self.ln(base_v + g * delta), p=2, dim=-1)
+
+
+class ConcatLinearProjection(nn.Module):
+  """Concatenation + 2-layer MLP Projection."""
+
+  def __init__(self, dim=640, dropout=0.1):
+    super().__init__()
+    self.proj = nn.Sequential(
+        nn.Linear(dim * 2, dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim, dim),
+    )
+    self.ln = nn.LayerNorm(dim)
+
+  def forward(self, z_v, z_g):
+    base_v = z_v if z_v.dim() == 2 else z_v.mean(dim=1)
+    base_g = z_g if z_g.dim() == 2 else z_g.mean(dim=1)
+    return F.normalize(
+        self.ln(self.proj(torch.cat([base_v, base_g], dim=-1))), p=2, dim=-1
+    )
+

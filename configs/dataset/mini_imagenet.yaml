@@ -14,7 +14,7 @@ graph:
   # -------------------------------------------------------------------------
   # SWITCH: true for coarsened (*_coarse.pt), false for uncoarsened (*.pt)
   # -------------------------------------------------------------------------
-  use_coarse: true
+  use_coarse: false
   image_size: 84
   use_graph_local_norm: false
   node_feat_dim: 11

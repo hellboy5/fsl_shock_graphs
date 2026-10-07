@@ -37,7 +37,9 @@ model:
   train_eps: true               # Options: Trainable epsilon in GINE
   use_input_mlp: true           # Options: 2-layer non-linear input MLP
   use_jk: true                  # Options: Jumping Knowledge (JK-Net)
-  fusion_type: "dual_gate"      # Options: 'dual_gate', 'concat', 'add'
+  fusion_type: "asymmetric"     # Options: 'asymmetric', 'gated', 'concat', 'add', 'bottleneck'
+  modality_dropout_v: 0.15      # Probability of zeroing vision during joint pretrain
+  modality_dropout_g: 0.15      # Probability of zeroing graph during joint pretrain
   modality_dropout: 0.0         # Options: 0.0 (off) or 0.15 (on)
   fsl_method: "protonet"        # Options: 'protonet', 'matching'
   distance_metric: "cosine"     # Options: 'cosine', 'euclidean'
@@ -51,7 +53,11 @@ training:
   lr: 0.001                     # Automatically upgraded to 0.1 for SGD in train.py
   optimizer: "auto"             # Options: 'auto', 'sgd', 'adamw'
   weight_decay: 0.0005
-  label_smoothing: 0.0         # Options: 0.0 (off), 0.10, 0.15 (for pre-training)
+  loss_type: "ce_multitask"     # Options: 'ce_multitask', 'clip_ce', 'supcon_ce', 'cosine_ce'
+  lambda_aux: 0.5               # Weight for unimodal auxiliary CE heads
+  lambda_contrast: 0.1          # Weight for cross-modal contrastive/align loss
+  use_ogm: false                # On-the-fly gradient modulation (OGM-GE)
+  label_smoothing: 0.0          # Options: 0.0 (off), 0.10, 0.15 (for pre-training)
   save_dir: "experiments"
   num_workers: 4
 

@@ -1,14 +1,20 @@
 # models/multimodal_network.py
-from models.encoders.cnn_encoder import VisionEncoder
-from models.encoders.gnn_encoder import GraphEncoder
-from models.heads import FewShotClassifier
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Try importing the attention fusion suite; provide self-contained fallback if needed
+from models.encoders.cnn_encoder import VisionEncoder
+from models.encoders.gnn_encoder import GraphEncoder
+from models.heads import FewShotClassifier
+
+# Try importing the attention fusion suite; provide self-contained fallbacks if needed
 try:
-  from models.layers.attention_fusion import build_attention_fusion
+  from models.layers.attention_fusion import (
+      build_attention_fusion,
+      AsymmetricResidualProjection,
+      GatedResidualFusion,
+      ConcatLinearProjection,
+  )
 except ImportError:
 
   def _ensure_token_seq(x):
@@ -19,6 +25,67 @@ except ImportError:
       return x.view(B, D, H * W).transpose(1, 2)
     return x
 
+  class AsymmetricResidualProjection(nn.Module):
+
+    def __init__(self, dim=640, dropout=0.1):
+      super().__init__()
+      self.proj_g = nn.Sequential(
+          nn.Linear(dim, dim),
+          nn.GELU(),
+          nn.Dropout(dropout),
+          nn.Linear(dim, dim),
+      )
+      self.ln = nn.LayerNorm(dim)
+
+    def forward(self, z_v, z_g):
+      base_v = z_v if z_v.dim() == 2 else z_v.mean(dim=1)
+      base_g = z_g if z_g.dim() == 2 else z_g.mean(dim=1)
+      return F.normalize(self.ln(base_v + self.proj_g(base_g)), p=2, dim=-1)
+
+  class GatedResidualFusion(nn.Module):
+
+    def __init__(self, dim=640, dropout=0.1):
+      super().__init__()
+      self.proj_g = nn.Sequential(
+          nn.Linear(dim, dim),
+          nn.GELU(),
+          nn.Dropout(dropout),
+          nn.Linear(dim, dim),
+      )
+      self.gate = nn.Sequential(
+          nn.Linear(dim * 2, dim // 2),
+          nn.ReLU(),
+          nn.Linear(dim // 2, dim),
+          nn.Sigmoid(),
+      )
+      self.ln = nn.LayerNorm(dim)
+
+    def forward(self, z_v, z_g):
+      base_v = z_v if z_v.dim() == 2 else z_v.mean(dim=1)
+      base_g = z_g if z_g.dim() == 2 else z_g.mean(dim=1)
+      g = self.gate(torch.cat([base_v, base_g], dim=-1))
+      delta = self.proj_g(base_g)
+      return F.normalize(self.ln(base_v + g * delta), p=2, dim=-1)
+
+  class ConcatLinearProjection(nn.Module):
+
+    def __init__(self, dim=640, dropout=0.1):
+      super().__init__()
+      self.proj = nn.Sequential(
+          nn.Linear(dim * 2, dim),
+          nn.GELU(),
+          nn.Dropout(dropout),
+          nn.Linear(dim, dim),
+      )
+      self.ln = nn.LayerNorm(dim)
+
+    def forward(self, z_v, z_g):
+      base_v = z_v if z_v.dim() == 2 else z_v.mean(dim=1)
+      base_g = z_g if z_g.dim() == 2 else z_g.mean(dim=1)
+      return F.normalize(
+          self.ln(self.proj(torch.cat([base_v, base_g], dim=-1))), p=2, dim=-1
+      )
+
   class MultimodalBottleneckAttention(nn.Module):
 
     def __init__(self, dim=640, num_bottlenecks=4, num_heads=8, dropout=0.1):
@@ -27,28 +94,16 @@ except ImportError:
       self.bottlenecks = nn.Parameter(torch.randn(1, num_bottlenecks, dim))
       nn.init.trunc_normal_(self.bottlenecks, std=0.02)
       self.v_to_b = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.g_to_b = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.b_to_v = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.b_to_g = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.ln_b = nn.LayerNorm(dim)
       self.ln_v = nn.LayerNorm(dim)
@@ -77,10 +132,7 @@ except ImportError:
     def __init__(self, dim=640, num_heads=8, dropout=0.1):
       super().__init__()
       self.cross_attn = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.gate_mlp = nn.Sequential(
           nn.Linear(dim * 2, dim // 2),
@@ -109,10 +161,7 @@ except ImportError:
       self.down_v = nn.Linear(dim, rank, bias=False)
       self.down_g = nn.Linear(dim, rank, bias=False)
       self.subspace_attn = nn.MultiheadAttention(
-          embed_dim=rank,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=rank, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.up_proj = nn.Sequential(
           nn.Linear(rank, dim),
@@ -139,16 +188,10 @@ except ImportError:
     def __init__(self, dim=640, num_heads=8, dropout=0.1):
       super().__init__()
       self.v_to_g = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.g_to_v = nn.MultiheadAttention(
-          embed_dim=dim,
-          num_heads=num_heads,
-          dropout=dropout,
-          batch_first=True,
+          embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
       )
       self.ln_v = nn.LayerNorm(dim)
       self.ln_g = nn.LayerNorm(dim)
@@ -185,7 +228,7 @@ except ImportError:
       raise ValueError(f'Unknown attention fusion type: {fusion_type}')
 
 
-# Standard Non-Attention Fusion Layer
+# Standard Legacy Non-Attention Fusion Layer
 class ResidualGateFusion(nn.Module):
 
   def __init__(self, dim=640):
@@ -203,7 +246,7 @@ class MultimodalFewShotNetwork(nn.Module):
   """Top-level network for Multimodal Few-Shot Learning.
 
   Routes data through unimodal encoders, fuses them if required,
-  and passes the resulting features to the Prototypical Network head.
+  and passes the resulting features to the FewShotClassifier head.
   """
 
   def __init__(self, cfg):
@@ -231,7 +274,9 @@ class MultimodalFewShotNetwork(nn.Module):
           num_layers=cfg.model.num_layers,
           dropout=cfg.model.dropout,
           norm_type=getattr(cfg.model, 'norm_type', 'graph'),
-          pooling_method=getattr(cfg.model, 'pooling_method', 'global_attention'),
+          pooling_method=getattr(
+              cfg.model, 'pooling_method', 'global_attention'
+          ),
           train_eps=getattr(cfg.model, 'train_eps', True),
           use_input_mlp=getattr(cfg.model, 'use_input_mlp', True),
           use_jk=getattr(cfg.model, 'use_jk', True),
@@ -239,39 +284,47 @@ class MultimodalFewShotNetwork(nn.Module):
 
     # --- 3. Fusion Block ---
     if self.modality == 'multimodal':
-      self.fusion_type = getattr(cfg.model, 'fusion_type', 'dual_gate')
+      self.fusion_type = getattr(cfg.model, 'fusion_type', 'asymmetric').lower()
 
-      attention_types = [
+      # Comprehensive dispatcher matching pretrain_multimodal.py
+      if self.fusion_type in [
           'bottleneck',
           'mbtb',
-          'asymmetric',
-          'asym',
+          'asymmetric_attn',
           'low_rank',
           'rank',
           'cross_attention',
           'cross_attn',
           'dense',
-      ]
-      if self.fusion_type in attention_types:
+      ]:
         self.fusion = build_attention_fusion(
             fusion_type=self.fusion_type,
             dim=640,
             dropout=getattr(cfg.model, 'dropout', 0.1),
         )
-      elif self.fusion_type == 'dual_gate':
-        self.fusion = ResidualGateFusion(dim=640)
-      elif self.fusion_type == 'concat':
-        self.fusion = nn.Linear(640 * 2, 640)
+      elif self.fusion_type in ['asymmetric', 'asym']:
+        self.fusion = AsymmetricResidualProjection(
+            dim=640, dropout=getattr(cfg.model, 'dropout', 0.1)
+        )
+      elif self.fusion_type in ['gated', 'dual_gate']:
+        self.fusion = GatedResidualFusion(
+            dim=640, dropout=getattr(cfg.model, 'dropout', 0.1)
+        )
+      elif self.fusion_type in ['concat', 'linear']:
+        self.fusion = ConcatLinearProjection(
+            dim=640, dropout=getattr(cfg.model, 'dropout', 0.1)
+        )
       elif self.fusion_type == 'add':
         self.fusion = None
       else:
         raise ValueError(f'Unknown fusion_type configured: {self.fusion_type}')
 
     # --- 4. Few-Shot Metric Head ---
+    scale = float(getattr(cfg.model, 'scale', 16.0))
     self.classifier = FewShotClassifier(
         method=cfg.model.fsl_method,
         distance=cfg.model.distance_metric,
-        scale=getattr(cfg.model, 'scale', 10.0),
+        scale=scale,
         learnable_scale=getattr(cfg.model, 'learnable_scale', False),
     )
 
@@ -291,6 +344,11 @@ class MultimodalFewShotNetwork(nn.Module):
         for p in self.graph_encoder.parameters():
           p.requires_grad = False
         print('--> [MultimodalNetwork] Graph encoder frozen.')
+
+    # Support loading full joint pre-trained weights directly
+    root_ckpt = getattr(cfg, 'checkpoint_path', None)
+    if root_ckpt:
+      self._load_full_model(root_ckpt)
 
   def _load_submodule(self, module, path, target_name):
     print(
@@ -316,38 +374,43 @@ class MultimodalFewShotNetwork(nn.Module):
         f' layers for {target_name}.'
     )
 
-  def forward(self, vision_batch, graph_batch, n_way, k_shot):
+  def _load_full_model(self, path):
+    print(f'--> [MultimodalNetwork] Loading joint model weights from: {path}')
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    state = ckpt.get('model_state_dict', ckpt)
+    target_dict = self.state_dict()
+    matched = {}
+
+    for k, v in state.items():
+      clean_k = k
+      for prefix in ['model.', 'module.']:
+        if clean_k.startswith(prefix):
+          clean_k = clean_k[len(prefix) :]
+      if clean_k in target_dict and v.shape == target_dict[clean_k].shape:
+        matched[clean_k] = v
+
+    target_dict.update(matched)
+    self.load_state_dict(target_dict, strict=False)
+    print(
+        f'--> [MultimodalNetwork] Successfully restored {len(matched)} layers'
+        ' from joint pre-training checkpoint.'
+    )
+
+  def extract_fused_features(self, vision_batch, graph_batch):
+    """Extracts unified 640D feature embeddings for test evaluation."""
     if self.modality == 'vision':
-      features = self.vision_encoder(vision_batch)
+      return self.vision_encoder(vision_batch)
     elif self.modality == 'graph':
-      features = self.graph_encoder(graph_batch)
+      return self.graph_encoder(graph_batch)
     elif self.modality == 'multimodal':
       v_feat = self.vision_encoder(vision_batch)
       g_feat = self.graph_encoder(graph_batch)
+      if self.fusion is None:
+        return F.normalize(v_feat + g_feat, p=2, dim=-1)
+      return self.fusion(v_feat, g_feat)
 
-      if self.fusion_type in [
-          'bottleneck',
-          'mbtb',
-          'asymmetric',
-          'asym',
-          'low_rank',
-          'rank',
-          'cross_attention',
-          'cross_attn',
-          'dense',
-      ]:
-        features = self.fusion(v_feat, g_feat)
-      elif self.fusion_type == 'dual_gate':
-        features = self.fusion(v_feat, g_feat)
-      elif self.fusion_type == 'concat':
-        features = F.normalize(
-            self.fusion(torch.cat([v_feat, g_feat], dim=-1)), p=2, dim=-1
-        )
-      elif self.fusion_type == 'add':
-        features = F.normalize(v_feat + g_feat, p=2, dim=-1)
-    else:
-      raise ValueError(f'Unknown modality configured: {self.modality}')
-
+  def forward(self, vision_batch, graph_batch, n_way, k_shot):
+    features = self.extract_fused_features(vision_batch, graph_batch)
     k_total = n_way * k_shot
     support_features = features[:k_total]
     query_features = features[k_total:]
