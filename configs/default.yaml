@@ -50,8 +50,14 @@ model:
 training:
   epochs: 100
   batch_size: 256
+  optimizer: "disentangled"     # Options: 'disentangled' (Recommended), 'adamw', 'sgd'
+  vision_lr: 0.05               # Optimal for ResNet-12 SGD
+  vision_weight_decay: 0.0005   # Standard vision weight decay
+  graph_lr: 0.001               # Optimal for GINE AdamW
+  graph_weight_decay: 0.0001    # Standard GNN weight decay
+  fusion_lr: 0.001              # Fast coordinate alignment
+  fusion_weight_decay: 0.0001
   lr: 0.001                     # Automatically upgraded to 0.1 for SGD in train.py
-  optimizer: "auto"             # Options: 'auto', 'sgd', 'adamw'
   weight_decay: 0.0005
   loss_type: "ce_multitask"     # Options: 'ce_multitask', 'clip_ce', 'supcon_ce', 'cosine_ce'
   lambda_aux: 0.5               # Weight for unimodal auxiliary CE heads
