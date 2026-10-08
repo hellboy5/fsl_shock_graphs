@@ -24,16 +24,33 @@ from utils.helpers import seed_everything
 
 def train_collate(data_list):
   """Collates both vision images and PyG shock graphs into a unified batch."""
-  images = torch.stack([d["image"] for d in data_list])
-  graphs = Batch.from_data_list([d["graph"] for d in data_list])
-  labels = torch.tensor([d["label"] for d in data_list], dtype=torch.long)
+  images = torch.stack([d.x_img for d in data_list])
+  
+  # Strip x_img to save GPU memory during graph message passing
+  graphs_clean = []
+  for d in data_list:
+    g = d.clone()
+    if hasattr(g, "x_img"):
+      del g.x_img
+    graphs_clean.append(g)
+    
+  graphs = Batch.from_data_list(graphs_clean)
+  labels = torch.tensor([d.y.item() for d in data_list], dtype=torch.long)
   return {"image": images, "graph": graphs, "label": labels}
 
 
 def val_episodic_collate(data_list):
   """Collates episodic evaluation batches for few-shot validation."""
-  images = torch.stack([d["image"] for d in data_list])
-  graphs = Batch.from_data_list([d["graph"] for d in data_list])
+  images = torch.stack([d.x_img for d in data_list])
+  
+  graphs_clean = []
+  for d in data_list:
+    g = d.clone()
+    if hasattr(g, "x_img"):
+      del g.x_img
+    graphs_clean.append(g)
+    
+  graphs = Batch.from_data_list(graphs_clean)
   return {"image": images, "graph": graphs}
 
 
