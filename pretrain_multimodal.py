@@ -38,9 +38,9 @@ def val_episodic_collate(data_list):
 
 
 def run_episodic_val(
-    model, val_loader, device, n_way=5, n_shot=1, n_query=15, episodes=200
+    model, val_loader, device, n_way=5, n_shot=1, n_query=15
 ):
-  """Evaluates 5-Way 1-Shot accuracy using unified cosine prototypes."""
+  """Evaluates few-shot accuracy using unified cosine prototypes."""
   model.eval()
   targets = (
       torch.arange(n_way)
@@ -62,12 +62,12 @@ def run_episodic_val(
       # 2. Form class prototypes from support items and L2-normalize
       z_supp = (
           z[:k_total].view(n_way, n_shot, -1).mean(dim=1)
-      )  # Class centroids [5, 640]
+      )  # Class centroids [n_way, 640]
       z_supp = F.normalize(z_supp, p=2, dim=-1)
 
       # 3. L2-normalize query features and compute metric cosine similarities
-      z_query = F.normalize(z[k_total:], p=2, dim=-1)  # Query items [75, 640]
-      cos_sim = torch.mm(z_query, z_supp.t())  # [75, 5]
+      z_query = F.normalize(z[k_total:], p=2, dim=-1)  # Query items [n_query_total, 640]
+      cos_sim = torch.mm(z_query, z_supp.t())  # [n_query_total, n_way]
 
       preds = cos_sim.argmax(dim=-1)
       accs.append((preds == targets).float().mean().item() * 100.0)
@@ -194,13 +194,26 @@ def run_joint_pretraining(cfg: DictConfig, device: torch.device):
       graph_transform=g_transform,
   )
 
+  val_n_way = int(
+      getattr(cfg.task, "val_n_way", getattr(cfg.task, "n_way", 5))
+  )
+  val_n_shot = int(
+      getattr(cfg.task, "val_n_shot", getattr(cfg.task, "n_shot", 1))
+  )
+  val_n_query = int(
+      getattr(cfg.task, "val_n_query", getattr(cfg.task, "n_query", 15))
+  )
+  val_episodes = int(
+      getattr(cfg.task, "val_episodes", 200)
+  )
+
   val_sampler = EpisodicBatchSampler(
       val_set.labels,
       val_set.base_names,
-      n_way=5,
-      n_shot=1,
-      n_query=15,
-      n_episodes=200,
+      val_n_way,
+      val_n_shot,
+      val_n_query,
+      val_episodes,
   )
 
   val_loader = DataLoader(
@@ -284,7 +297,12 @@ def run_joint_pretraining(cfg: DictConfig, device: torch.device):
 
     # 5. Episodic Validation on Novel Classes
     val_acc, val_ci = run_episodic_val(
-        model, val_loader, device, n_way=5, n_shot=1, n_query=15, episodes=200
+        model,
+        val_loader,
+        device,
+        n_way=val_n_way,
+        n_shot=val_n_shot,
+        n_query=val_n_query,
     )
 
     if len(schedulers) == 3:
