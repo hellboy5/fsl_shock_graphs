@@ -63,6 +63,7 @@ training:
   lambda_aux: 0.5               # Weight for unimodal auxiliary CE heads
   lambda_contrast: 0.1          # Weight for cross-modal contrastive/align loss
   use_ogm: false                # On-the-fly gradient modulation (OGM-GE)
+  ogm_alpha: 1.0                # Hyperparameter controlling OGM dampening steepness
   label_smoothing: 0.0          # Options: 0.0 (off), 0.10, 0.15 (for pre-training)
   save_dir: "experiments"
   num_workers: 4

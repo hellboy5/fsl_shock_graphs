@@ -22,6 +22,33 @@ from train import seed_worker
 from utils.helpers import seed_everything
 
 
+def apply_ogm_gradient_modulation(
+    model: torch.nn.Module,
+    loss_v: torch.Tensor,
+    loss_g: torch.Tensor,
+    alpha: float = 1.0,
+):
+  """Applies On-the-Fly Gradient Modulation to prevent modality dominance.
+
+  If the auxiliary vision loss is lower than the auxiliary graph loss (vision
+  is dominating), we scale down the vision encoder's gradients before the
+  optimizer step.
+  """
+  if loss_v.item() < loss_g.item():
+    # 1. Compute the discrepancy ratio
+    ratio = (loss_g.item() - loss_v.item()) / (loss_g.item() + 1e-8)
+
+    # 2. Compute the throttling coefficient via hyperbolic tangent decay
+    # alpha controls the steepness of the dampening curve
+    coeff = 1.0 - math.tanh(alpha * ratio)
+
+    # 3. Intercept and scale down the gradients of all ResNet-12 parameters
+    # This prevents the visual stream from overtaking the GNN's learning paths
+    for name, p in model.vision_encoder.named_parameters():
+      if p.grad is not None:
+        p.grad.data.mul_(coeff)
+
+
 def train_collate(data_list):
   """Collates both vision images and PyG shock graphs into a unified batch."""
   images = torch.stack([d.x_img for d in data_list])
@@ -282,12 +309,13 @@ def run_joint_pretraining(cfg: DictConfig, device: torch.device):
       loss.backward()
 
       # On-the-Fly Gradient Modulation: Throttles vision if dominating
-      if use_ogm and (loss_v.item() < loss_g.item()):
-        ratio = (loss_g.item() - loss_v.item()) / (loss_g.item() + 1e-6)
-        coeff = 1.0 - math.tanh(ratio)
-        for p in model.vision_encoder.parameters():
-          if p.grad is not None:
-            p.grad.data.mul_(coeff)
+      if use_ogm:
+        apply_ogm_gradient_modulation(
+            model=model,
+            loss_v=loss_v,
+            loss_g=loss_g,
+            alpha=float(getattr(cfg.training, "ogm_alpha", 1.0)),
+        )
 
       # Global gradient clipping to preserve GINE numerical stability
       torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
