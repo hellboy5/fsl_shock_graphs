@@ -23,6 +23,7 @@ from torch_geometric.nn.aggr import (
     MultiAggregation,
     SoftmaxAggregation,
 )
+from torch_geometric.utils import degree
 
 try:
   from torch_scatter import scatter_add
@@ -130,11 +131,113 @@ class TAGCN_EdgeAugmented(nn.Module):
     return torch.cat(layer_outputs, dim=-1) if self.use_jk else x
 
 
+class GMNLayer(nn.Module):
+  """Single GNN layer supporting intra-graph message passing and GMN cross-graph matching."""
+
+  def __init__(
+      self,
+      conv_type: str,
+      in_dim: int,
+      out_dim: int,
+      edge_dim: int = None,
+      heads: int = 4,
+      dropout: float = 0.0,
+      act: str = "relu",
+      norm: str = "batch",
+      use_residual: bool = True,
+  ):
+    super().__init__()
+    self.conv_type = conv_type.lower()
+    self.use_residual = use_residual and (in_dim == out_dim)
+    self.dropout = nn.Dropout(dropout)
+    self.scale = 1.0 / (out_dim**0.5)
+
+    # 1. Activation function
+    if act == "relu":
+      self.act = nn.ReLU()
+    elif act == "gelu":
+      self.act = nn.GELU()
+    elif act == "leaky_relu":
+      self.act = nn.LeakyReLU(0.2)
+    else:
+      self.act = nn.Identity()
+
+    # 2. Convolution operator
+    if self.conv_type == "gcn":
+      self.conv = GCNConv(in_dim, out_dim)
+    elif self.conv_type == "gat":
+      self.conv = GATConv(
+          in_dim, out_dim // heads, heads=heads, dropout=dropout
+      )
+    elif self.conv_type == "gin":
+      mlp = nn.Sequential(
+          nn.Linear(in_dim, out_dim),
+          self.act,
+          nn.Linear(out_dim, out_dim),
+      )
+      self.conv = GINConv(mlp, train_eps=True)
+    elif self.conv_type == "gine":
+      mlp = nn.Sequential(
+          nn.Linear(in_dim, out_dim),
+          self.act,
+          nn.Linear(out_dim, out_dim),
+      )
+      self.conv = GINEConv(mlp, edge_dim=edge_dim, train_eps=True)
+    else:
+      raise ValueError(f"Unsupported conv_type: {conv_type}")
+
+    # 3. Normalization layer
+    if norm == "batch":
+      self.norm = nn.BatchNorm1d(out_dim)
+    elif norm == "layer":
+      self.norm = nn.LayerNorm(out_dim)
+    else:
+      self.norm = nn.Identity()
+
+    # 4. GMN Cross-matching heads (Active only when cross_match=True)
+    self.proj_match = nn.Linear(out_dim, out_dim)
+    self.node_update = nn.Sequential(
+        nn.Linear(out_dim * 2, out_dim),
+        self.act,
+        nn.Linear(out_dim, out_dim),
+    )
+
+  def forward(
+      self,
+      x: torch.Tensor,
+      edge_index: torch.Tensor,
+      edge_attr: torch.Tensor = None,
+      cross_match: bool = False,
+      mu: torch.Tensor = None,
+  ) -> torch.Tensor:
+    residual = x
+
+    # Step A: Intra-graph message passing
+    if self.conv_type == "gine":
+      out = self.conv(x, edge_index, edge_attr=edge_attr)
+    else:
+      out = self.conv(x, edge_index)
+
+    out = self.norm(out)
+    out = self.act(out)
+    out = self.dropout(out)
+
+    if self.use_residual:
+      out = out + residual
+
+    # Step B: Joint node state update with cross-graph matching residuals
+    if cross_match and (mu is not None):
+      out = self.node_update(torch.cat([out, self.proj_match(mu)], dim=-1))
+
+    return out
+
+
 class GraphEncoder(nn.Module):
   """Modular GNN Backbone for Shock Graphs.
 
   Supports GINE, GPS, PNA, GATv2, ResGated, and TAGCN. Routes across 7 pooling
-  and readout paradigms via `pooling_method`.
+  and readout paradigms via `pooling_method`. Now supports integrated GMN
+  cross-graph matching as well.
   """
 
   def __init__(
@@ -159,6 +262,7 @@ class GraphEncoder(nn.Module):
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
     self.pooling_method = str(pooling_method).lower()
+    self.scale = 1.0 / (hidden_dim**0.5)
 
     # Dimension after multi-layer concatenation (JK-Net)
     effective_dim = (hidden_dim * num_layers) if use_jk else hidden_dim
@@ -185,7 +289,16 @@ class GraphEncoder(nn.Module):
       )
       self._setup_pooling_modules(effective_dim)
       self.projector = nn.Sequential(
-          nn.Linear(in_dim, proj_feat_dim), nn.BatchNorm1d(proj_feat_dim)
+          nn.Linear(in_dim, proj_feat_dim),
+          nn.BatchNorm1d(proj_feat_dim),
+      )
+
+      # Isolated GMN matching heads for TAGCN
+      self.proj_match_tagcn = nn.Linear(effective_dim, effective_dim)
+      self.node_update_tagcn = nn.Sequential(
+          nn.Linear(effective_dim * 2, effective_dim),
+          nn.GELU(),
+          nn.Linear(effective_dim, effective_dim),
       )
       return
 
@@ -307,65 +420,60 @@ class GraphEncoder(nn.Module):
 
     # 5. Output Projection Head to Metric Space (640D)
     self.projector = nn.Sequential(
-        nn.Linear(in_dim, proj_feat_dim), nn.BatchNorm1d(proj_feat_dim)
+        nn.Linear(in_dim, proj_feat_dim),
+        nn.BatchNorm1d(proj_feat_dim),
+    )
+
+    # 6. GMN Cross-Graph Matching Heads (added for GMN support, keeps existing weight keys intact)
+    self.proj_match = nn.Linear(hidden_dim, hidden_dim)
+    self.node_update = nn.Sequential(
+        nn.Linear(hidden_dim * 2, hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, hidden_dim),
     )
 
   def _setup_pooling_modules(self, effective_dim):
     """Initializes PyG aggregation and pooling modules without hardcoded node sizes."""
     if self.pooling_method == "median":
-      # L1-Median robust order statistics against outlier noise
       self.pool_op = MedianAggregation()
-
     elif self.pooling_method == "multi_moment":
-      # Concatenates 4 moments: [mean, std, min, max]
       self.pool_op = MultiAggregation(
           aggrs=["mean", "std", "min", "max"], mode="cat"
       )
-
     elif self.pooling_method == "global_attention":
-      # 2-layer MLP soft saliency gate (Li et al.)
       gate_nn = nn.Sequential(
           nn.Linear(effective_dim, effective_dim // 2),
           nn.ReLU(),
           nn.Linear(effective_dim // 2, 1),
       )
       self.pool_op = GlobalAttention(gate_nn=gate_nn)
-
     elif self.pooling_method == "softmax":
-      # Learnable inverse-temperature continuous aggregation
       self.pool_op = SoftmaxAggregation(learn=True)
-
     elif self.pooling_method == "deep_sets":
-      # Universal Set Function Approximator: rho(sum(phi(x)))
       phi = nn.Sequential(
           nn.Linear(effective_dim, effective_dim),
           nn.ReLU(),
           nn.Linear(effective_dim, effective_dim),
       )
-      rho = nn.Sequential(nn.Linear(effective_dim, effective_dim), nn.ReLU())
+      rho = nn.Sequential(
+          nn.Linear(effective_dim, effective_dim), nn.ReLU()
+      )
       self.pool_op = DeepSetsAggregation(local_nn=phi, global_nn=rho)
-
     elif self.pooling_method == "gmt":
-      # Native PyG GraphMultisetTransformer (channels=dim, k=4 representative seeds, heads=2)
-      # Completely size-agnostic: handles 5 nodes to 1,600+ nodes dynamically!
       self.pool_op = GraphMultisetTransformer(
           channels=effective_dim, k=4, num_encoder_blocks=1, heads=2
       )
-
     elif self.pooling_method == "sag_pool":
-      # Self-Attention Graph Pooling: prunes bottom 30% of noise nodes
       self.sag = SAGPooling(in_channels=effective_dim, ratio=0.7)
 
   def _apply_pooling(self, x_final, edge_index, edge_attr, batch):
     """Dispatches the configured pooling method to produce a single graph vector."""
     if self.pooling_method == "mean":
       return global_mean_pool(x_final, batch)
-
     elif self.pooling_method in ["dual_pool", "mean_max"]:
       p_mean = global_mean_pool(x_final, batch)
       p_max = global_max_pool(x_final, batch)
       return torch.cat([p_mean, p_max], dim=-1)
-
     elif self.pooling_method in [
         "median",
         "multi_moment",
@@ -373,24 +481,19 @@ class GraphEncoder(nn.Module):
         "deep_sets",
         "gmt",
     ]:
-      # PyG Aggregation operators expect (x, index=batch)
       return self.pool_op(x_final, index=batch)
-
     elif self.pooling_method == "global_attention":
       return self.pool_op(x_final, batch)
-
     elif self.pooling_method == "sag_pool":
-      # Unpack 5 elements returned by PyG SAGPooling
       x_pruned, _, _, batch_pruned, _ = self.sag(
           x_final, edge_index, edge_attr=edge_attr, batch=batch
       )
       return global_mean_pool(x_pruned, batch_pruned)
-
     else:
       return global_mean_pool(x_final, batch)
 
   def forward(self, data):
-    # TAGCN Branch
+    """Standard forward pass on a single graph or batch (Stage 1 / Unimodal)."""
     if self.gnn_type == "TAGCN":
       x_nodes = self.tagcn(data)
       pooled = self._apply_pooling(
@@ -398,7 +501,6 @@ class GraphEncoder(nn.Module):
       )
       return self.projector(pooled)
 
-    # Standard GNN Path
     x, edge_index, edge_attr, batch = (
         data.x,
         data.edge_index,
@@ -431,8 +533,204 @@ class GraphEncoder(nn.Module):
         layer_outputs.append(x)
 
     x_final = torch.cat(layer_outputs, dim=-1) if self.use_jk else x
-
-    # Execute pooling
     pooled = self._apply_pooling(x_final, edge_index, edge_attr, batch)
-
     return self.projector(pooled)
+
+  def forward_gmn(self, g1, g2):
+    """GMN forward pass: Joint cross-graph propagation over paired batches.
+
+    Keeps GINE, GPS, PNA, GATv2, ResGated, and TAGCN fully supported.
+    Uses batch_mask to restrict attention strictly within matching graph pairs.
+    """
+    x1, edge_index1, edge_attr1 = g1.x, g1.edge_index, g1.edge_attr
+    x2, edge_index2, edge_attr2 = g2.x, g2.edge_index, g2.edge_attr
+
+    batch1 = (
+        g1.batch
+        if hasattr(g1, "batch") and g1.batch is not None
+        else torch.zeros(x1.size(0), dtype=torch.long, device=x1.device)
+    )
+    batch2 = (
+        g2.batch
+        if hasattr(g2, "batch") and g2.batch is not None
+        else torch.zeros(x2.size(0), dtype=torch.long, device=x2.device)
+    )
+
+    # 1. Handle TAGCN branch
+    if self.gnn_type == "TAGCN":
+      x1 = self.tagcn(g1)
+      x2 = self.tagcn(g2)
+
+      deg1 = degree(edge_index1[0], num_nodes=x1.size(0))
+      deg2 = degree(edge_index2[0], num_nodes=x2.size(0))
+      mask1 = (deg1 == 1) | (deg1 >= 3)
+      mask2 = (deg2 == 1) | (deg2 >= 3)
+
+      # Safety Guard: If any graph has 0 seed nodes, default to all nodes
+      if not mask1.any():
+        mask1 = torch.ones_like(mask1)
+      if not mask2.any():
+        mask2 = torch.ones_like(mask2)
+
+      x1_seeds = x1[mask1]
+      x2_seeds = x2[mask2]
+      batch1_seeds = batch1[mask1]
+      batch2_seeds = batch2[mask2]
+
+      scale = 1.0 / (x1.size(-1)**0.5)
+      scores = torch.mm(x1_seeds, x2_seeds.t()) * scale
+
+      # Restrict cross-attention to pairs from the same graph index in the batch
+      batch_mask = batch1_seeds.unsqueeze(1) == batch2_seeds.unsqueeze(0)
+      scores = scores.masked_fill(~batch_mask, -1e9)
+
+      a12 = torch.nan_to_num(F.softmax(scores, dim=-1), nan=0.0)
+      scores_t = scores.t().masked_fill(~batch_mask.t(), -1e9)
+      a21 = torch.nan_to_num(F.softmax(scores_t, dim=-1), nan=0.0)
+
+      retrieved2 = torch.mm(a12, x2_seeds)
+      retrieved1 = torch.mm(a21, x1_seeds)
+
+      mu1 = torch.zeros_like(x1)
+      mu2 = torch.zeros_like(x2)
+      mu1[mask1] = x1_seeds - retrieved2
+      mu2[mask2] = x2_seeds - retrieved1
+
+      # Eliminate bias leakage from non-seed nodes
+      proj_mu1 = self.proj_match_tagcn(mu1)
+      proj_mu2 = self.proj_match_tagcn(mu2)
+      proj_mu1[~mask1] = 0.0
+      proj_mu2[~mask2] = 0.0
+
+      x1 = self.node_update_tagcn(torch.cat([x1, proj_mu1], dim=-1))
+      x2 = self.node_update_tagcn(torch.cat([x2, proj_mu2], dim=-1))
+
+      pooled1 = self._apply_pooling(x1, edge_index1, edge_attr1, batch1)
+      pooled2 = self._apply_pooling(x2, edge_index2, edge_attr2, batch2)
+
+      z1 = self.projector(pooled1)
+      z2 = self.projector(pooled2)
+
+      z1_norm = F.normalize(z1, p=2, dim=-1)
+      z2_norm = F.normalize(z2, p=2, dim=-1)
+      dist = torch.sum((z1_norm - z2_norm) ** 2, dim=-1)
+      return dist, z1_norm, z2_norm
+
+    # 2. Standard GNN GMN path (GINE, GPS, PNA, GATv2, ResGated)
+    h1 = self.node_encoder(x1)
+    h2 = self.node_encoder(x2)
+
+    e1 = (
+        self.edge_encoder(edge_attr1)
+        if (self.edge_encoder is not None and edge_attr1 is not None)
+        else None
+    )
+    e2 = (
+        self.edge_encoder(edge_attr2)
+        if (self.edge_encoder is not None and edge_attr2 is not None)
+        else None
+    )
+
+    deg1 = degree(edge_index1[0], num_nodes=h1.size(0))
+    deg2 = degree(edge_index2[0], num_nodes=h2.size(0))
+    mask1 = (deg1 == 1) | (deg1 >= 3)
+    mask2 = (deg2 == 1) | (deg2 >= 3)
+
+    # Safety Guard: If any graph has 0 seed nodes, default to all nodes
+    if not mask1.any():
+      mask1 = torch.ones_like(mask1)
+    if not mask2.any():
+      mask2 = torch.ones_like(mask2)
+
+    batch1_seeds = batch1[mask1]
+    batch2_seeds = batch2[mask2]
+    batch_mask = batch1_seeds.unsqueeze(1) == batch2_seeds.unsqueeze(0)
+
+    layer_outputs1 = []
+    layer_outputs2 = []
+
+    for i, layer in enumerate(self.layers):
+      h1_in = h1
+      h2_in = h2
+
+      # A. Intra-graph message passing
+      if self.gnn_type in ["GINE", "GATv2", "PNA"]:
+        h1 = layer(h1, edge_index1, edge_attr=e1)
+        h2 = layer(h2, edge_index2, edge_attr=e2)
+      elif self.gnn_type == "GPS":
+        h1 = layer(h1, edge_index1, batch=batch1, edge_attr=e1)
+        h2 = layer(h2, edge_index2, batch=batch2, edge_attr=e2)
+      elif self.gnn_type == "ResGated":
+        h1 = layer(h1, edge_index1)
+        h2 = layer(h2, edge_index2)
+
+      h1 = (
+          self.norms[i](h1, batch1)
+          if isinstance(self.norms[i], GraphNorm)
+          else self.norms[i](h1)
+      )
+      h2 = (
+          self.norms[i](h2, batch2)
+          if isinstance(self.norms[i], GraphNorm)
+          else self.norms[i](h2)
+      )
+
+      h1 = F.relu(h1)
+      h2 = F.relu(h2)
+
+      # B. Inter-graph cross-attention matching (GMN)
+      h1_seeds = h1[mask1]
+      h2_seeds = h2[mask2]
+
+      # Pairwise cross-attention scores between nodes
+      scores = torch.mm(h1_seeds, h2_seeds.t()) * self.scale
+      scores = scores.masked_fill(~batch_mask, -1e9)
+
+      a12 = torch.nan_to_num(F.softmax(scores, dim=-1), nan=0.0)
+      scores_t = scores.t().masked_fill(~batch_mask.t(), -1e9)
+      a21 = torch.nan_to_num(F.softmax(scores_t, dim=-1), nan=0.0)
+
+      retrieved2 = torch.mm(a12, h2_seeds)
+      retrieved1 = torch.mm(a21, h1_seeds)
+
+      # Match vectors (residuals)
+      mu1_seeds = h1_seeds - retrieved2
+      mu2_seeds = h2_seeds - retrieved1
+
+      mu1 = torch.zeros_like(h1)
+      mu2 = torch.zeros_like(h2)
+      mu1[mask1] = mu1_seeds
+      mu2[mask2] = mu2_seeds
+
+      # Eliminate bias leakage from non-seed nodes
+      proj_mu1 = self.proj_match(mu1)
+      proj_mu2 = self.proj_match(mu2)
+      proj_mu1[~mask1] = 0.0
+      proj_mu2[~mask2] = 0.0
+
+      # C. Joint node state updates
+      h1 = self.node_update(torch.cat([h1, proj_mu1], dim=-1))
+      h2 = self.node_update(torch.cat([h2, proj_mu2], dim=-1))
+
+      h1 = h1 + h1_in
+      h2 = h2 + h2_in
+
+      if self.use_jk:
+        layer_outputs1.append(h1)
+        layer_outputs2.append(h2)
+
+    h1_final = torch.cat(layer_outputs1, dim=-1) if self.use_jk else h1
+    h2_final = torch.cat(layer_outputs2, dim=-1) if self.use_jk else h2
+
+    # Execute pooling & projection
+    pooled1 = self._apply_pooling(h1_final, edge_index1, e1, batch1)
+    pooled2 = self._apply_pooling(h2_final, edge_index2, e2, batch2)
+
+    z1 = self.projector(pooled1)
+    z2 = self.projector(pooled2)
+
+    z1_norm = F.normalize(z1, p=2, dim=-1)
+    z2_norm = F.normalize(z2, p=2, dim=-1)
+    dist = torch.sum((z1_norm - z2_norm) ** 2, dim=-1)
+
+    return dist, z1_norm, z2_norm
