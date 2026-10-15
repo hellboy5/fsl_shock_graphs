@@ -114,10 +114,17 @@ def run_training(cfg, device):
   ckpt_path = getattr(cfg, 'checkpoint_path', None) or getattr(
       cfg.evaluation, 'checkpoint_path', None
   )
+  has_loaded_checkpoint = False
+
   if ckpt_path:
     print(f'--> [Warm-Start] Loading pre-trained weights from: {ckpt_path}')
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    # Discard 64-class classification projection head from Stage 1 pre-training
+    state_dict = {
+        k: v for k, v in state_dict.items() if not k.startswith("classifier")
+    }
 
     # Allow loading state_dict whether saved as full model or encoder submodule
     model_dict = model.state_dict()
@@ -138,12 +145,13 @@ def run_training(cfg, device):
 
     model_dict.update(matched_dict)
     model.load_state_dict(model_dict, strict=False)
+    has_loaded_checkpoint = len(matched_dict) > 0
     print(
         f'--> [Warm-Start] Successfully loaded {len(matched_dict)} /'
         f' {len(model_dict)} tensors.'
     )
 
-  # Optimizer: SGD Nesterov for Vision, AdamW for Graph and Fusion
+  # Optimizer routing
   opt_type = getattr(cfg.training, 'optimizer', 'auto')
   use_sgd = (
       (opt_type == 'sgd')
@@ -171,6 +179,42 @@ def run_training(cfg, device):
         f'--> [Optimizer: SGD Nesterov] lr={lr}, momentum=0.9,'
         f' weight_decay={cfg.training.weight_decay} | Scheduler:'
         ' CosineAnnealingLR'
+    )
+  elif has_loaded_checkpoint and cfg.model.fsl_method == "gmn":
+    # --- Disentangled GMN Learning Rates: Stable Backbone, Active Matching ---
+    backbone_params = []
+    matching_params = []
+
+    for name, param in model.named_parameters():
+      if (
+          "proj_match" in name
+          or "node_update" in name
+          or "proj_match_tagcn" in name
+          or "node_update_tagcn" in name
+      ):
+        matching_params.append(param)
+      else:
+        backbone_params.append(param)
+
+    optimizer = optim.AdamW([
+        {
+            "params": backbone_params,
+            "lr": 1e-5,
+            "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
+        },  # Slow, stable backbone
+        {
+            "params": matching_params,
+            "lr": 1e-3,
+            "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
+        },  # Active learning matching heads
+    ])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.training.epochs, eta_min=1e-6
+    )
+    print(
+        "--> [Optimizer: Disentangled GMN AdamW] "
+        "backbone_lr=1e-5, matching_head_lr=1e-3, "
+        f"weight_decay={cfg.training.weight_decay} | Scheduler: CosineAnnealingLR"
     )
   else:
     trainable_params = [p for p in model.parameters() if p.requires_grad]

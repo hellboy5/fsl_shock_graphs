@@ -247,12 +247,14 @@ class MultimodalFewShotNetwork(nn.Module):
 
   Routes data through unimodal encoders, fuses them if required,
   and passes the resulting features to the FewShotClassifier head.
+  Now supports GMN cross-graph matching when fsl_method='gmn'.
   """
 
   def __init__(self, cfg):
     super().__init__()
     self.cfg = cfg
     self.modality = cfg.model.modality
+    self.fsl_method = cfg.model.fsl_method
 
     # --- 1. Vision Pathway (Native 640D) ---
     if self.modality in ['vision', 'multimodal']:
@@ -320,9 +322,17 @@ class MultimodalFewShotNetwork(nn.Module):
         raise ValueError(f'Unknown fusion_type configured: {self.fusion_type}')
 
     # --- 4. Few-Shot Metric Head ---
-    scale = float(getattr(cfg.model, 'scale', 16.0))
+    scale = float(getattr(cfg.model, 'scale', 2.0))
+
+    if self.fsl_method == "gmn":
+      if self.modality != "graph":
+        raise ValueError("fsl_method='gmn' is currently only optimized for modality='graph' unimodal matching.")
+      classifier_method = "protonet"  # Dummy fallback to prevent FewShotClassifier init crashes
+    else:
+      classifier_method = self.fsl_method
+
     self.classifier = FewShotClassifier(
-        method=cfg.model.fsl_method,
+        method=classifier_method,
         distance=cfg.model.distance_metric,
         scale=scale,
         learnable_scale=getattr(cfg.model, 'learnable_scale', False),
@@ -410,6 +420,31 @@ class MultimodalFewShotNetwork(nn.Module):
       return self.fusion(v_feat, g_feat)
 
   def forward(self, vision_batch, graph_batch, n_way, k_shot):
+    # --- GMN Branch: Interactive Pairwise Cross-Graph Attention ---
+    if self.fsl_method == "gmn":
+      num_support = n_way * k_shot
+      
+      # Unpack the unified batch list back into support and query Batch objects
+      graph_list = graph_batch.to_data_list()
+      
+      from torch_geometric.data import Batch
+
+      device = graph_batch.x.device
+      batch_s = Batch.from_data_list(graph_list[:num_support]).to(device)
+      batch_q = Batch.from_data_list(graph_list[num_support:]).to(device)
+      
+      # Run joint interactive matching forward pass on the GPU
+      dist_matrix, _, _ = self.graph_encoder.forward_gmn(batch_q, batch_s)
+      
+      # For k-shot (k > 1), average distances across shots per class
+      if k_shot > 1:
+        dist_matrix = dist_matrix.view(dist_matrix.size(0), n_way, k_shot).mean(dim=-1)
+        
+      # Scale distances into class logits via negative scaling
+      logits = -scale*dist_matrix
+      return logits
+
+    # --- Standard ProtoNet/Matching Siamese Branch ---
     features = self.extract_fused_features(vision_batch, graph_batch)
     k_total = n_way * k_shot
     support_features = features[:k_total]

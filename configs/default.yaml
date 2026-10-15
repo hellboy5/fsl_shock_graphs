@@ -45,7 +45,8 @@ model:
   distance_metric: "cosine"     # Options: 'cosine', 'euclidean'
   scale: 10.0                   # Options: tau parameter 
   learnable_scale: false        # Options: Learnable inverse temperature (1/tau)
-
+  fsl_method: "gmn"             # Options: 'protonet', 'matching', 'gmn'
+  
 # Training Hyperparameters
 training:
   epochs: 100
