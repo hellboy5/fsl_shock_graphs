@@ -334,7 +334,7 @@ class MultimodalFewShotNetwork(nn.Module):
     self.classifier = FewShotClassifier(
         method=classifier_method,
         distance=cfg.model.distance_metric,
-        scale=scale,
+        scale=self.scale,
         learnable_scale=getattr(cfg.model, 'learnable_scale', False),
     )
 
