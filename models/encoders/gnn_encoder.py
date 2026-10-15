@@ -540,7 +540,7 @@ class GraphEncoder(nn.Module):
     """GMN forward pass: Joint cross-graph propagation over paired batches.
 
     Keeps GINE, GPS, PNA, GATv2, ResGated, and TAGCN fully supported.
-    Uses batch_mask to restrict attention strictly within matching graph pairs.
+    Computes all-pairs pairwise distance matrix of shape [N_query, N_support].
     """
     x1, edge_index1, edge_attr1 = g1.x, g1.edge_index, g1.edge_attr
     x2, edge_index2, edge_attr2 = g2.x, g2.edge_index, g2.edge_attr
@@ -574,19 +574,12 @@ class GraphEncoder(nn.Module):
 
       x1_seeds = x1[mask1]
       x2_seeds = x2[mask2]
-      batch1_seeds = batch1[mask1]
-      batch2_seeds = batch2[mask2]
 
       scale = 1.0 / (x1.size(-1)**0.5)
       scores = torch.mm(x1_seeds, x2_seeds.t()) * scale
 
-      # Restrict cross-attention to pairs from the same graph index in the batch
-      batch_mask = batch1_seeds.unsqueeze(1) == batch2_seeds.unsqueeze(0)
-      scores = scores.masked_fill(~batch_mask, -1e9)
-
       a12 = torch.nan_to_num(F.softmax(scores, dim=-1), nan=0.0)
-      scores_t = scores.t().masked_fill(~batch_mask.t(), -1e9)
-      a21 = torch.nan_to_num(F.softmax(scores_t, dim=-1), nan=0.0)
+      a21 = torch.nan_to_num(F.softmax(scores.t(), dim=-1), nan=0.0)
 
       retrieved2 = torch.mm(a12, x2_seeds)
       retrieved1 = torch.mm(a21, x1_seeds)
@@ -613,7 +606,7 @@ class GraphEncoder(nn.Module):
 
       z1_norm = F.normalize(z1, p=2, dim=-1)
       z2_norm = F.normalize(z2, p=2, dim=-1)
-      dist = torch.sum((z1_norm - z2_norm) ** 2, dim=-1)
+      dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
       return dist, z1_norm, z2_norm
 
     # 2. Standard GNN GMN path (GINE, GPS, PNA, GATv2, ResGated)
@@ -641,10 +634,6 @@ class GraphEncoder(nn.Module):
       mask1 = torch.ones_like(mask1)
     if not mask2.any():
       mask2 = torch.ones_like(mask2)
-
-    batch1_seeds = batch1[mask1]
-    batch2_seeds = batch2[mask2]
-    batch_mask = batch1_seeds.unsqueeze(1) == batch2_seeds.unsqueeze(0)
 
     layer_outputs1 = []
     layer_outputs2 = []
@@ -682,13 +671,11 @@ class GraphEncoder(nn.Module):
       h1_seeds = h1[mask1]
       h2_seeds = h2[mask2]
 
-      # Pairwise cross-attention scores between nodes
+      # Pairwise cross-attention scores between candidate nodes across query and support
       scores = torch.mm(h1_seeds, h2_seeds.t()) * self.scale
-      scores = scores.masked_fill(~batch_mask, -1e9)
 
       a12 = torch.nan_to_num(F.softmax(scores, dim=-1), nan=0.0)
-      scores_t = scores.t().masked_fill(~batch_mask.t(), -1e9)
-      a21 = torch.nan_to_num(F.softmax(scores_t, dim=-1), nan=0.0)
+      a21 = torch.nan_to_num(F.softmax(scores.t(), dim=-1), nan=0.0)
 
       retrieved2 = torch.mm(a12, h2_seeds)
       retrieved1 = torch.mm(a21, h1_seeds)
@@ -731,6 +718,6 @@ class GraphEncoder(nn.Module):
 
     z1_norm = F.normalize(z1, p=2, dim=-1)
     z2_norm = F.normalize(z2, p=2, dim=-1)
-    dist = torch.sum((z1_norm - z2_norm) ** 2, dim=-1)
+    dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
 
     return dist, z1_norm, z2_norm

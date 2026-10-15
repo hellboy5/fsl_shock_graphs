@@ -41,7 +41,6 @@ model:
   modality_dropout_v: 0.15      # Probability of zeroing vision during joint pretrain
   modality_dropout_g: 0.15      # Probability of zeroing graph during joint pretrain
   modality_dropout: 0.0         # Options: 0.0 (off) or 0.15 (on)
-  fsl_method: "protonet"        # Options: 'protonet', 'matching'
   distance_metric: "cosine"     # Options: 'cosine', 'euclidean'
   scale: 10.0                   # Options: tau parameter 
   learnable_scale: false        # Options: Learnable inverse temperature (1/tau)
