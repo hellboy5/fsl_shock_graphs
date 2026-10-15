@@ -322,7 +322,7 @@ class MultimodalFewShotNetwork(nn.Module):
         raise ValueError(f'Unknown fusion_type configured: {self.fusion_type}')
 
     # --- 4. Few-Shot Metric Head ---
-    scale = float(getattr(cfg.model, 'scale', 2.0))
+    self.scale = float(getattr(cfg.model, 'scale', 2.0))
 
     if self.fsl_method == "gmn":
       if self.modality != "graph":
@@ -441,7 +441,7 @@ class MultimodalFewShotNetwork(nn.Module):
         dist_matrix = dist_matrix.view(dist_matrix.size(0), n_way, k_shot).mean(dim=-1)
         
       # Scale distances into class logits via negative scaling
-      logits = -scale*dist_matrix
+      logits = -self.scale*dist_matrix
       return logits
 
     # --- Standard ProtoNet/Matching Siamese Branch ---
