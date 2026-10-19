@@ -199,7 +199,7 @@ def run_training(cfg, device):
     optimizer = optim.AdamW([
         {
             "params": backbone_params,
-            "lr": 1e-5,
+            "lr": 1e-4,
             "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
         },  # Slow, stable backbone
         {
@@ -213,7 +213,7 @@ def run_training(cfg, device):
     )
     print(
         "--> [Optimizer: Disentangled GMN AdamW] "
-        "backbone_lr=1e-5, matching_head_lr=1e-3, "
+        "backbone_lr=1e-4, matching_head_lr=1e-3, "
         f"weight_decay={cfg.training.weight_decay} | Scheduler: CosineAnnealingLR"
     )
   else:
