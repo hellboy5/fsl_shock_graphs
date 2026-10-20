@@ -182,6 +182,11 @@ def run_training(cfg, device):
     )
   elif has_loaded_checkpoint and cfg.model.fsl_method == "gmn":
     # --- Disentangled GMN Learning Rates: Stable Backbone, Active Matching ---
+    # Re-zero final layer of node_update in case Stage 1 checkpoint saved random init weights
+    if hasattr(model, "graph_encoder") and hasattr(model.graph_encoder, "node_update"):
+      torch.nn.init.zeros_(model.graph_encoder.node_update[-1].weight)
+      torch.nn.init.zeros_(model.graph_encoder.node_update[-1].bias)
+
     backbone_params = []
     matching_params = []
 
@@ -204,7 +209,7 @@ def run_training(cfg, device):
         },  # Slow, stable backbone
         {
             "params": matching_params,
-            "lr": 1e-3,
+            "lr": 2e-3,
             "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
         },  # Active learning matching heads
     ])
@@ -213,7 +218,7 @@ def run_training(cfg, device):
     )
     print(
         "--> [Optimizer: Disentangled GMN AdamW] "
-        "backbone_lr=1e-4, matching_head_lr=1e-3, "
+        "backbone_lr=1e-4, matching_head_lr=2e-3, "
         f"weight_decay={cfg.training.weight_decay} | Scheduler: CosineAnnealingLR"
     )
   else:
