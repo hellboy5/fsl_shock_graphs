@@ -317,8 +317,9 @@ def compute_cross_transformer_reconstruction_distance(
   H_q = F.normalize(H_q, p=2, dim=-1)
   H_s = F.normalize(H_s, p=2, dim=-1)
 
-  # Pairwise cosine similarity scaled by 1/sqrt(D): [N_query, N_support, K_max_q, K_max_s]
-  scores = torch.einsum("qid, sjd -> qsij", H_q, H_s) / (D**0.5)
+
+  # H_q and H_s are unit-normalized (cosine sim in [-1, 1]); scale by 10.0 for sharp softmax matching
+  scores = torch.einsum("qid, sjd -> qsij", H_q, H_s) * 10.0
 
   # Direction 1: Query keypoints reconstructed by Support s
   scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
@@ -365,7 +366,7 @@ class GraphEncoder(nn.Module):
       train_eps=True,
       use_input_mlp=True,
       use_jk=True,
-      use_reconstruction_dist=False,
+      use_reconstruction_dist=True,
       **kwargs,
   ):
     super(GraphEncoder, self).__init__()
@@ -747,7 +748,7 @@ class GraphEncoder(nn.Module):
             N_support,
             scale=scale,
         )
-        dist = 0.5 * dist_global + 0.5 * dist_recon
+        dist = dist_recon
       else:
         dist = dist_global
 
@@ -875,7 +876,7 @@ class GraphEncoder(nn.Module):
           N_support=N_support,
           scale=self.scale,
       )
-      dist = 0.5 * dist_global + 0.5 * dist_recon
+      dist = dist_recon
     else:
       dist = dist_global
 
