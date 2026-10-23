@@ -245,41 +245,50 @@ def compute_pairwise_seed_residuals(
 ):
   """Computes isolated pairwise cross-attention residuals strictly within each (q, s) pair.
 
-  Prevents support-set mixing across different classes in the episode.
+  Uses L2-normalized keypoint similarity for stability and contracts candidate
+  weights before feature retrieval to avoid 4D [N_q, N_s, K, D] memory overhead.
   """
   H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
 
-  # Pairwise dot-product scores strictly between Query q and Support s: [N_q, N_s, K_q, K_s]
-  scores = torch.einsum("qid, sjd -> qsij", H_q, H_s) * scale
+  # L2-normalize for bounded, stable cosine attention scores across all layers
+  H_q_norm = F.normalize(H_q, p=2, dim=-1)
+  H_s_norm = F.normalize(H_s, p=2, dim=-1)
+
+  # Pairwise cosine similarity strictly between Query q and Support s: [N_q, N_s, K_q, K_s]
+  cos_sim = torch.einsum("qid, sjd -> qsij", H_q_norm, H_s_norm)
+  scores = cos_sim * 5.0
 
   # 1. Query -> Support attention (softmax strictly over Support graph s's keypoints)
   scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
   a12 = torch.nan_to_num(F.softmax(scores_q2s, dim=-1), nan=0.0)
-  retrieved2_pair = torch.einsum("qsij, sjd -> qsid", a12, H_s)
-  mu1_pair = H_q.unsqueeze(1) - retrieved2_pair  # [N_q, N_s, K_q, D]
 
-  # Weight across support candidates by soft-min alignment error so best-matching support dominates
+  # Weight support candidates by mean keypoint cosine match similarity: [N_q, N_s]
   q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
-  pair_err_q = (
-      (mu1_pair.pow(2).sum(dim=-1) * M_q.unsqueeze(1)).sum(dim=-1) / q_counts
+  pair_sim_q = (
+      ((cos_sim * a12).sum(dim=-1) * M_q.unsqueeze(1)).sum(dim=-1) / q_counts
   )
-  w_q2s = F.softmax(-pair_err_q * scale, dim=-1)  # [N_q, N_s]
-  mu1_dense = torch.einsum("qs, qsid -> qid", w_q2s, mu1_pair)
+  w_q2s = F.softmax(pair_sim_q * 5.0, dim=-1)  # [N_q, N_s]
+
+  # Contract (w_q2s * a12) with H_s directly -> [N_q, K_q, D] (avoids 4D [N_q, N_s, K_q, D] tensor)
+  a12_weighted = w_q2s.unsqueeze(-1).unsqueeze(-1) * a12
+  retrieved2 = torch.einsum("qsij, sjd -> qid", a12_weighted, H_s)
+  mu1_dense = H_q - retrieved2
   mu1_seeds = mu1_dense[M_q]
 
   # 2. Support -> Query attention (softmax strictly over Query graph q's keypoints)
   scores_s2q = scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9)
   a21 = torch.nan_to_num(F.softmax(scores_s2q, dim=-2), nan=0.0)
-  retrieved1_pair = torch.einsum("qsij, qid -> qsjd", a21, H_q)
-  mu2_pair = H_s.unsqueeze(0) - retrieved1_pair  # [N_q, N_s, K_s, D]
 
   s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)  # Shape: [1, N_s]
-  pair_err_s = (
-      (mu2_pair.pow(2).sum(dim=-1) * M_s.unsqueeze(0)).sum(dim=-1) / s_counts
+  pair_sim_s = (
+      ((cos_sim * a21).sum(dim=-2) * M_s.unsqueeze(0)).sum(dim=-1) / s_counts
   )
-  w_s2q = F.softmax(-pair_err_s * scale, dim=0)  # [N_q, N_s]
-  mu2_dense = torch.einsum("qs, qsjd -> sjd", w_s2q, mu2_pair)
+  w_s2q = F.softmax(pair_sim_s * 5.0, dim=0)  # [N_q, N_s]
+
+  a21_weighted = w_s2q.unsqueeze(-1).unsqueeze(-1) * a21
+  retrieved1 = torch.einsum("qsij, qid -> sjd", a21_weighted, H_q)
+  mu2_dense = H_s - retrieved1
   mu2_seeds = mu2_dense[M_s]
 
   return mu1_seeds, mu2_seeds
@@ -294,49 +303,55 @@ def compute_cross_transformer_reconstruction_distance(
     batch2,
     N_query,
     N_support,
+    projector=None,
     scale=None,
 ):
-  """Computes unpooled Bidirectional CrossTransformers Keypoint Reconstruction Distance.
+  """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance.
 
-  Evaluates the Mean Squared Reconstruction Error of topological keypoints
-  (junctions & tips) strictly per (query, support) pair without Global Average Pooling dilution.
+  1. Projects keypoints through Stage 1's `self.projector` (Linear + BatchNorm1d)
+     to center the positive ReLU activations and prevent constant-vector mode collapse.
+  2. Evaluates expected squared Euclidean distance on the unit sphere (2 - 2 * cos_sim)
+     without Jensen norm shrinkage or 4D feature reconstruction tensors.
   """
-  D = h1_final.size(-1)
-  if scale is None:
-    scale = 1.0 / (D**0.5)
-
   h1_seeds = h1_final[mask1]
   h2_seeds = h2_final[mask2]
   batch1_seeds = batch1[mask1]
   batch2_seeds = batch2[mask2]
 
+  # Map seed nodes through Stage 1's Linear + BatchNorm1d projector to center channels & prevent collapse
+  if projector is not None and h1_seeds.size(-1) == projector[0].in_features:
+    all_seeds = torch.cat([h1_seeds, h2_seeds], dim=0)
+    proj_seeds = projector(all_seeds)
+    h1_seeds = proj_seeds[: h1_seeds.size(0)]
+    h2_seeds = proj_seeds[h1_seeds.size(0) :]
+
   H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
 
-  # Unit-normalize keypoint descriptors so reconstruction error is bounded on [0, 4]
+  # Unit-normalize centered 640D keypoint descriptors: ||h_i|| = 1, ||h_j|| = 1
   H_q = F.normalize(H_q, p=2, dim=-1)
   H_s = F.normalize(H_s, p=2, dim=-1)
 
+  # Pairwise cosine similarity in [-1, 1] and squared Euclidean distance in [0, 4]
+  cos_sim = torch.einsum("qid, sjd -> qsij", H_q, H_s)
+  pair_dist_sq = 2.0 - 2.0 * cos_sim  # ||h_i^q - h_j^s||^2 on the unit sphere
+  scores = cos_sim * 10.0
 
-  # H_q and H_s are unit-normalized (cosine sim in [-1, 1]); scale by 10.0 for sharp softmax matching
-  scores = torch.einsum("qid, sjd -> qsij", H_q, H_s) * 10.0
-
-  # Direction 1: Query keypoints reconstructed by Support s
+  # Direction 1: Query keypoints matched against Support s keypoints
   scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
   A_q2s = torch.nan_to_num(F.softmax(scores_q2s, dim=-1), nan=0.0)
-  H_q_hat = torch.einsum("qsij, sjd -> qsid", A_q2s, H_s)
 
-  err_q = torch.sum((H_q.unsqueeze(1) - H_q_hat) ** 2, dim=-1)
+  # Expected squared distance per query keypoint: sum_j A_ij * ||h_i^q - h_j^s||^2
+  err_q = (A_q2s * pair_dist_sq).sum(dim=-1)  # [N_query, N_support, K_max_q]
   err_q = err_q.masked_fill(~M_q.unsqueeze(1), 0.0)
   K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
   dist_q2s = err_q.sum(dim=-1) / K_q_counts  # [N_query, N_support]
 
-  # Direction 2: Support keypoints reconstructed by Query q (Symmetric term)
+  # Direction 2: Support keypoints matched against Query q keypoints (Symmetric term)
   scores_s2q = scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9)
   A_s2q = torch.nan_to_num(F.softmax(scores_s2q, dim=-2), nan=0.0)
-  H_s_hat = torch.einsum("qsij, qid -> qsjd", A_s2q, H_q)
 
-  err_s = torch.sum((H_s.unsqueeze(0) - H_s_hat) ** 2, dim=-1)
+  err_s = (A_s2q * pair_dist_sq).sum(dim=-2)  # [N_query, N_support, K_max_s]
   err_s = err_s.masked_fill(~M_s.unsqueeze(0), 0.0)
   K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
   dist_s2q = err_s.sum(dim=-1) / K_s_counts  # [N_query, N_support]
@@ -730,14 +745,8 @@ class GraphEncoder(nn.Module):
       x1 = x1 + delta1
       x2 = x2 + delta2
 
-      pooled1 = self._apply_pooling(x1, edge_index1, edge_attr1, batch1)
-      pooled2 = self._apply_pooling(x2, edge_index2, edge_attr2, batch2)
-      z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
-      z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
-      dist_global = torch.cdist(z1_norm, z2_norm, p=2) ** 2
-
       if self.use_reconstruction_dist:
-        dist_recon = compute_cross_transformer_reconstruction_distance(
+        dist = compute_cross_transformer_reconstruction_distance(
             x1,
             x2,
             mask1,
@@ -746,13 +755,17 @@ class GraphEncoder(nn.Module):
             batch2,
             N_query,
             N_support,
+            projector=self.projector,
             scale=scale,
         )
-        dist = dist_recon
+        return dist, None, None
       else:
-        dist = dist_global
-
-      return dist, z1_norm, z2_norm
+        pooled1 = self._apply_pooling(x1, edge_index1, edge_attr1, batch1)
+        pooled2 = self._apply_pooling(x2, edge_index2, edge_attr2, batch2)
+        z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
+        z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
+        dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
+        return dist, z1_norm, z2_norm
 
     # 2. Standard GNN GMN path (GINE, GPS, PNA, GATv2, ResGated)
     h1 = self.node_encoder(x1)
@@ -853,19 +866,8 @@ class GraphEncoder(nn.Module):
     h1_final = torch.cat(layer_outputs1, dim=-1) if self.use_jk else h1
     h2_final = torch.cat(layer_outputs2, dim=-1) if self.use_jk else h2
 
-    # Execute pooling & projection
-    pooled1 = self._apply_pooling(h1_final, edge_index1, e1, batch1)
-    pooled2 = self._apply_pooling(h2_final, edge_index2, e2, batch2)
-
-    z1 = self.projector(pooled1)
-    z2 = self.projector(pooled2)
-
-    z1_norm = F.normalize(z1, p=2, dim=-1)
-    z2_norm = F.normalize(z2, p=2, dim=-1)
-    dist_global = torch.cdist(z1_norm, z2_norm, p=2) ** 2
-
     if self.use_reconstruction_dist:
-      dist_recon = compute_cross_transformer_reconstruction_distance(
+      dist = compute_cross_transformer_reconstruction_distance(
           h1_final=h1_final,
           h2_final=h2_final,
           mask1=mask1,
@@ -874,10 +876,16 @@ class GraphEncoder(nn.Module):
           batch2=batch2,
           N_query=N_query,
           N_support=N_support,
+          projector=self.projector,
           scale=self.scale,
       )
-      dist = dist_recon
+      return dist, None, None
     else:
-      dist = dist_global
-
-    return dist, z1_norm, z2_norm
+      pooled1 = self._apply_pooling(h1_final, edge_index1, e1, batch1)
+      pooled2 = self._apply_pooling(h2_final, edge_index2, e2, batch2)
+      z1 = self.projector(pooled1)
+      z2 = self.projector(pooled2)
+      z1_norm = F.normalize(z1, p=2, dim=-1)
+      z2_norm = F.normalize(z2, p=2, dim=-1)
+      dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
+      return dist, z1_norm, z2_norm

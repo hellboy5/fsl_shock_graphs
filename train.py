@@ -209,7 +209,7 @@ def run_training(cfg, device):
         },  # Slow, stable backbone
         {
             "params": matching_params,
-            "lr": 2e-3,
+            "lr": 1e-3,
             "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
         },  # Active learning matching heads
     ])
@@ -218,7 +218,7 @@ def run_training(cfg, device):
     )
     print(
         "--> [Optimizer: Disentangled GMN AdamW] "
-        "backbone_lr=1e-4, matching_head_lr=2e-3, "
+        "backbone_lr=1e-4, matching_head_lr=1e-3, "
         f"weight_decay={cfg.training.weight_decay} | Scheduler: CosineAnnealingLR"
     )
   else:
