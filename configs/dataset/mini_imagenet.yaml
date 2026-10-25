@@ -1,6 +1,7 @@
 # configs/dataset/mini_imagenet.yaml
 name: "mini_imagenet"
 data_root: "/users/mnarayan/data/mnarayan/mini_imagenet"
+
 num_classes: 64
 num_val_classes: 16
 num_test_classes: 20
@@ -11,27 +12,19 @@ vision:
   std:  [0.229, 0.224, 0.225]
 
 graph:
-  # -------------------------------------------------------------------------
   # SWITCH: true for coarsened (*_coarse.pt), false for uncoarsened (*.pt)
-  # -------------------------------------------------------------------------
   use_coarse: false
   image_size: 84
   use_graph_local_norm: false
-  node_feat_dim: 11
-  edge_feat_dim: 14
 
-  # =========================================================================
   # 1. COARSENED STATS (Auto-selected when use_coarse: true)
-  # =========================================================================
   coarse:
     node_mean: [0.0000, 0.0000, -4.7841]
     node_std:  [1.0000, 1.0000,  2.8085]
     edge_mean: [-2.7235, 0.1364, 0.1750, -3.9838, 0.1639, 0.3833, -3.9838, 0.1639, 0.3833, -5.2735, -3.5030, -3.0329, 0.0000, 0.7982]
     edge_std:  [ 1.1500, 0.2304, 0.2980,  2.5565, 0.2935, 0.6837,  2.5565, 0.2935, 0.6837,  1.8933,  1.1304,  1.0966, 0.4442, 0.5725]
 
-  # =========================================================================
   # 2. UNCOARSENED STATS (Auto-selected when use_coarse: false)
-  # =========================================================================
   uncoarse:
     node_mean: [0.0000, 0.0000, -4.4521]
     node_std:  [1.0000, 1.0000,  2.0547]
