@@ -4,10 +4,10 @@ import random
 from data.dataset import MultimodalFSLDataset
 from data.samplers import EpisodicBatchSampler
 from data.transforms import get_graph_transform, get_vision_transform
+from losses.gmn_loss import GMNEpisodicLoss
 from models.multimodal_network import MultimodalFewShotNetwork
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
@@ -110,10 +110,8 @@ def run_training(cfg, device):
 
   model = MultimodalFewShotNetwork(cfg).to(device)
 
-  # --- Warm-Start Checkpoint Loading (Strategy 3 / Meta-Baseline) ---
-  ckpt_path = getattr(cfg, 'checkpoint_path', None) or getattr(
-      cfg.evaluation, 'checkpoint_path', None
-  )
+  # --- Warm-Start Checkpoint Loading ---
+  ckpt_path = getattr(cfg, 'checkpoint_path', None)
   has_loaded_checkpoint = False
 
   if ckpt_path:
@@ -126,7 +124,6 @@ def run_training(cfg, device):
         k: v for k, v in state_dict.items() if not k.startswith("classifier")
     }
 
-    # Allow loading state_dict whether saved as full model or encoder submodule
     model_dict = model.state_dict()
     matched_dict = {}
     for k, v in state_dict.items():
@@ -151,39 +148,14 @@ def run_training(cfg, device):
         f' {len(model_dict)} tensors.'
     )
 
-  # Optimizer routing
-  opt_type = getattr(cfg.training, 'optimizer', 'auto')
-  use_sgd = (
-      (opt_type == 'sgd')
-      or (cfg.model.modality == 'vision' and opt_type == 'auto')
-      or (cfg.training.lr >= 0.05)
-  )
+  # --- Optimizer Routing (AdamW) ---
+  wd = float(getattr(cfg.training, "weight_decay", 0.0001))
 
-  if use_sgd:
-    lr = (
-        0.1
-        if (cfg.model.modality == 'vision' and cfg.training.lr == 0.001)
-        else cfg.training.lr
-    )
-    optimizer = optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=0.9,
-        weight_decay=cfg.training.weight_decay,
-        nesterov=True,
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.training.epochs, eta_min=1e-5
-    )
-    print(
-        f'--> [Optimizer: SGD Nesterov] lr={lr}, momentum=0.9,'
-        f' weight_decay={cfg.training.weight_decay} | Scheduler:'
-        ' CosineAnnealingLR'
-    )
-  elif has_loaded_checkpoint and cfg.model.fsl_method == "gmn":
-    # --- Disentangled GMN Learning Rates: Stable Backbone, Active Matching ---
+  if has_loaded_checkpoint and cfg.model.fsl_method == "gmn":
     # Re-zero final layer of node_update in case Stage 1 checkpoint saved random init weights
-    if hasattr(model, "graph_encoder") and hasattr(model.graph_encoder, "node_update"):
+    if hasattr(model, "graph_encoder") and hasattr(
+        model.graph_encoder, "node_update"
+    ):
       torch.nn.init.zeros_(model.graph_encoder.node_update[-1].weight)
       torch.nn.init.zeros_(model.graph_encoder.node_update[-1].bias)
 
@@ -191,51 +163,39 @@ def run_training(cfg, device):
     matching_params = []
 
     for name, param in model.named_parameters():
-      if (
-          "proj_match" in name
-          or "node_update" in name
-          or "proj_match_tagcn" in name
-          or "node_update_tagcn" in name
-      ):
+      if not param.requires_grad:
+        continue
+      if "proj_match" in name or "node_update" in name:
         matching_params.append(param)
       else:
         backbone_params.append(param)
 
+    b_lr = float(getattr(cfg.training, "backbone_lr", 1e-4))
+    m_lr = float(getattr(cfg.training, "matching_lr", 1e-3))
     optimizer = optim.AdamW([
-        {
-            "params": backbone_params,
-            "lr": 1e-4,
-            "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
-        },  # Slow, stable backbone
-        {
-            "params": matching_params,
-            "lr": 1e-3,
-            "weight_decay": float(getattr(cfg.training, "weight_decay", 0.0001)),
-        },  # Active learning matching heads
+        {"params": backbone_params, "lr": b_lr, "weight_decay": wd},
+        {"params": matching_params, "lr": m_lr, "weight_decay": wd},
     ])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.training.epochs, eta_min=1e-6
-    )
     print(
         "--> [Optimizer: Disentangled GMN AdamW] "
-        "backbone_lr=1e-4, matching_head_lr=1e-3, "
-        f"weight_decay={cfg.training.weight_decay} | Scheduler: CosineAnnealingLR"
+        f"backbone_lr={b_lr}, matching_head_lr={m_lr}, "
+        f"weight_decay={wd} | Scheduler: CosineAnnealingLR"
     )
   else:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
         trainable_params,
         lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.training.epochs, eta_min=1e-6
+        weight_decay=wd,
     )
     print(
-        f'--> [Optimizer: AdamW] lr={cfg.training.lr},'
-        f' weight_decay={cfg.training.weight_decay} | Scheduler:'
-        ' CosineAnnealingLR'
+        f"--> [Optimizer: AdamW] lr={cfg.training.lr}, "
+        f"weight_decay={wd} | Scheduler: CosineAnnealingLR"
     )
+
+  scheduler = optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, T_max=cfg.training.epochs, eta_min=1e-6
+  )
 
   targets = (
       torch.arange(n_way)
@@ -244,6 +204,14 @@ def run_training(cfg, device):
       .to(device, non_blocking=True)
   )
   best_val_acc = 0.0
+  scale = float(getattr(cfg.model, 'scale', 5.0))
+
+  criterion = GMNEpisodicLoss(
+      tau=1.0 / scale,
+      margin=float(getattr(cfg.training, 'triplet_margin', 0.2)),
+      use_hard_mining=bool(getattr(cfg.training, 'use_hard_mining', False)),
+      lambda_triplet=float(getattr(cfg.training, 'lambda_triplet', 0.2)),
+  ).to(device)
 
   print(
       f'--- Starting Training: {cfg.model.modality} modality | Seed: {cfg.seed}'
@@ -268,7 +236,7 @@ def run_training(cfg, device):
       )
 
       logits = model(img_batch, graph_batch, n_way, n_shot)
-      loss = F.cross_entropy(logits, targets)
+      loss = criterion(logits, targets, is_distance=False)
       loss.backward()
 
       torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

@@ -1,7 +1,11 @@
 # pretrain.py
-import os
 import math
+import os
 import random
+from data.dataset import MultimodalFSLDataset
+from data.samplers import EpisodicBatchSampler
+from data.transforms import get_graph_transform
+from models.encoders.gnn_encoder import GraphEncoder
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,11 +15,6 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
-from data.dataset import MultimodalFSLDataset
-from data.samplers import EpisodicBatchSampler
-from data.transforms import get_graph_transform
-from models.encoders.gnn_encoder import GraphEncoder
-
 
 def seed_worker(worker_id):
   worker_seed = torch.initial_seed() % (2**32)
@@ -23,14 +22,14 @@ def seed_worker(worker_id):
   random.seed(worker_seed)
 
 
-# 1. Mini-Batch Collate Function for Training (64-Class CE)
+# 1. Mini-Batch Collate Function for Training (Base Classes CE)
 def pretrain_graph_collate(data_list):
   targets = torch.tensor([d.y.item() for d in data_list], dtype=torch.long)
   batched_graphs = Batch.from_data_list(data_list)
   return batched_graphs, targets
 
 
-# 2. Episodic Collate Function for Validation (5-Way 1-Shot)
+# 2. Episodic Collate Function for Validation (N-Way K-Shot)
 def val_episodic_collate(data_list):
   return Batch.from_data_list(data_list)
 
@@ -48,18 +47,17 @@ class NormalizedLinear(nn.Module):
     nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
   def forward(self, x):
-    # L2 normalize both the incoming features and the class weight vectors
     x_norm = F.normalize(x, p=2, dim=-1)
     w_norm = F.normalize(self.weight, p=2, dim=-1)
-    # Return scaled cosine similarity logits
     return self.scale * F.linear(x_norm, w_norm)
 
 
 # 4. Model Wrapper
 class GraphClassificationModel(nn.Module):
 
-  def __init__(self, cfg, num_classes=64):
+  def __init__(self, cfg):
     super(GraphClassificationModel, self).__init__()
+    num_classes = int(getattr(cfg.dataset, "num_classes", 64))
     g_hidden_dim = getattr(cfg.model, "graph_hidden_dim", 128)
     g_proj_dim = getattr(cfg.model, "graph_proj_dim", 640)
 
@@ -68,29 +66,29 @@ class GraphClassificationModel(nn.Module):
         edge_feat_dim=cfg.model.edge_feat_dim,
         hidden_dim=g_hidden_dim,
         proj_feat_dim=g_proj_dim,
-        gnn_type=cfg.model.gnn_type,
+        gnn_type=getattr(cfg.model, "gnn_type", "GINE"),
         num_layers=cfg.model.num_layers,
         dropout=cfg.model.dropout,
         norm_type=getattr(cfg.model, "norm_type", "graph"),
-        pooling_method=getattr(cfg.model, "pooling_method", "global_attention"),
+        pooling_method=getattr(cfg.model, "pooling_method", "mean"),
         train_eps=getattr(cfg.model, "train_eps", True),
         use_input_mlp=getattr(cfg.model, "use_input_mlp", True),
         use_jk=getattr(cfg.model, "use_jk", True),
+        use_reconstruction_dist=getattr(
+            cfg.model, "use_reconstruction_dist", True
+        ),
     )
-    # Cosine Classifier enforces angular manifold during pre-training
     scale = float(getattr(cfg.model, "scale", 16.0))
     self.classifier = NormalizedLinear(g_proj_dim, num_classes, scale=scale)
 
   def forward(self, graph_batch):
     z = self.encoder(graph_batch)  # [B, 640]
-    logits = self.classifier(z)  # [B, 64]
+    logits = self.classifier(z)  # [B, num_classes]
     return logits, z
 
 
-# 5. Novel-Class Validation Step (5-Way 1-Shot Cosine Matching)
-def validate_few_shot(
-    encoder, val_loader, n_way, n_query, eval_episodes, device
-):
+# 5. Novel-Class Validation Step (N-Way K-Shot Cosine Matching)
+def validate_few_shot(encoder, val_loader, n_way, n_shot, n_query, device):
   encoder.eval()
   targets = (
       torch.arange(n_way)
@@ -103,14 +101,14 @@ def validate_few_shot(
   with torch.no_grad():
     for graph_batch in val_loader:
       graph_batch = graph_batch.to(device, non_blocking=True)
-      embeddings = encoder(graph_batch)  # [Total_Samples, 640]
+      embeddings = encoder(graph_batch)
       embeddings = F.normalize(embeddings, p=2, dim=-1)
 
-      n_support = n_way * 1  # 5 support samples (1-shot)
-      prototypes = embeddings[:n_support]  #
-      queries = embeddings[n_support:]  # [75, 640]
+      n_support = n_way * n_shot
+      support = embeddings[:n_support].view(n_way, n_shot, -1).mean(dim=1)
+      prototypes = F.normalize(support, p=2, dim=-1)
+      queries = embeddings[n_support:]
 
-      # Cosine similarity scaled by 10.0
       logits = torch.mm(queries, prototypes.t()) * 10.0
       preds = logits.argmax(dim=-1)
       acc = (preds == targets).float().mean().item() * 100.0
@@ -130,18 +128,17 @@ def run_pretraining(cfg, device):
   batch_size = int(getattr(cfg.training, "batch_size", 128))
   num_workers = int(getattr(cfg.training, "num_workers", 4))
 
-  # Validation task parameters reused cleanly from cfg.task
-  val_n_way = 5
-  val_n_shot = 1
-  val_n_query = cfg.task.n_query
+  val_n_way = int(getattr(cfg.task, "n_way", 5))
+  val_n_shot = int(getattr(cfg.task, "n_shot", 1))
+  val_n_query = int(getattr(cfg.task, "n_query", 15))
   val_episodes = int(getattr(cfg.task, "val_episodes", 200))
 
-  # Enforce Un-Coarsened mode
-  cfg.dataset.graph.use_coarse = False
   g_transform = get_graph_transform(cfg)
 
-  # Datasets
-  print("--> [Data] Loading Base Training Set (64 Classes, 383K Graphs)...")
+  print(
+      f"--> [Data] Loading Base Training Set ({cfg.dataset.num_classes}"
+      " Classes)..."
+  )
   train_set = MultimodalFSLDataset(
       cfg.dataset,
       modality="graph",
@@ -150,7 +147,10 @@ def run_pretraining(cfg, device):
       graph_transform=g_transform,
   )
 
-  print("--> [Data] Loading Novel Validation Set (16 Classes, 5-Way 1-Shot)...")
+  print(
+      f"--> [Data] Loading Novel Validation Set ({cfg.dataset.num_val_classes}"
+      f" Classes, {val_n_way}-Way {val_n_shot}-Shot)..."
+  )
   val_set = MultimodalFSLDataset(
       cfg.dataset,
       modality="graph",
@@ -162,7 +162,6 @@ def run_pretraining(cfg, device):
   g = torch.Generator()
   g.manual_seed(cfg.seed)
 
-  # Standard Mini-Batch DataLoader for Training (100% Data Exposure)
   train_loader = DataLoader(
       train_set,
       batch_size=batch_size,
@@ -175,7 +174,6 @@ def run_pretraining(cfg, device):
       generator=g,
   )
 
-  # Episodic Sampler for Validation (Strictly 5-Way 1-Shot)
   val_sampler = EpisodicBatchSampler(
       val_set.labels,
       val_set.base_names,
@@ -192,56 +190,24 @@ def run_pretraining(cfg, device):
       pin_memory=True,
   )
 
-  model = GraphClassificationModel(cfg, num_classes=64).to(device)
+  model = GraphClassificationModel(cfg).to(device)
 
-  # Adaptive Optimizer Setup (AdamW defaults for GNNs)
-  opt_type = getattr(cfg.training, "optimizer", "auto")
-  use_sgd = (opt_type == "sgd") or (cfg.training.lr >= 0.05)
+  lr = float(getattr(cfg.training, "lr", 0.001))
+  wd = float(getattr(cfg.training, "weight_decay", 0.0001))
+  optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+  scheduler = optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, T_max=epochs, eta_min=1e-6
+  )
+  print(f"--> [Pretrain Optimizer: AdamW] lr={lr}, weight_decay={wd}")
 
-  if use_sgd:
-    lr = cfg.training.lr
-    optimizer = optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=0.9,
-        weight_decay=cfg.training.weight_decay,
-        nesterov=True,
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-5
-    )
-    print(
-        f"--> [Pretrain Optimizer: SGD Nesterov] lr={lr}, momentum=0.9,"
-        f" weight_decay={cfg.training.weight_decay}"
-    )
-  else:
-    # GNN Gold Standard: AdamW with lr=0.001
-    lr = (
-        0.001
-        if (cfg.training.lr == 0.001 or opt_type == "auto")
-        else cfg.training.lr
-    )
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=float(getattr(cfg.training, "weight_decay", 0.0001)),
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-6
-    )
-    print(
-        f"--> [Pretrain Optimizer: AdamW] lr={lr},"
-        f" weight_decay={optimizer.param_groups[0]['weight_decay']}"
-    )
-
-  smoothing = float(getattr(cfg.training, "label_smoothing", 0.1))
+  smoothing = float(getattr(cfg.training, "label_smoothing", 0.0))
   criterion = nn.CrossEntropyLoss(label_smoothing=smoothing)
   best_val_acc = 0.0
 
   print("\n" + "=" * 80)
   print(
-      f"   STARTING 64-CLASS SUPERVISED PRE-TRAINING ({epochs} Epochs, Batch:"
-      f" {batch_size})   "
+      f"   STARTING {cfg.dataset.num_classes}-CLASS SUPERVISED PRE-TRAINING"
+      f" ({epochs} Epochs, Batch: {batch_size})   "
   )
   print("=" * 80)
 
@@ -250,7 +216,8 @@ def run_pretraining(cfg, device):
     train_losses, train_accs = [], []
 
     pbar = tqdm(
-        train_loader, desc=f"Epoch {epoch:02d}/{epochs:02d} [Train 64-Class]"
+        train_loader,
+        desc=f"Epoch {epoch:02d}/{epochs:02d} [Train {cfg.dataset.num_classes}-Class]",
     )
     for graphs, targets in pbar:
       graphs = graphs.to(device, non_blocking=True)
@@ -272,13 +239,12 @@ def run_pretraining(cfg, device):
 
     scheduler.step()
 
-    # 4. Validation step (Strict 5-Way 1-Shot)
-    val_1shot, val_ci = validate_few_shot(
+    val_acc, val_ci = validate_few_shot(
         model.encoder,
         val_loader,
         val_n_way,
+        val_n_shot,
         val_n_query,
-        val_episodes,
         device,
     )
 
@@ -288,13 +254,13 @@ def run_pretraining(cfg, device):
 
     print(
         f"Epoch {epoch:02d}/{epochs:02d} | Train Loss: {epoch_loss:.4f} |"
-        f" Train 64-Class Acc: {epoch_train_acc:.2f}% | Novel Val 1-Shot:"
-        f" {val_1shot:.2f}% ± {val_ci:.2f}% | LR: {current_lr:.6f}"
+        f" Train {cfg.dataset.num_classes}-Class Acc: {epoch_train_acc:.2f}% |"
+        f" Novel Val {val_n_shot}-Shot: {val_acc:.2f}% ± {val_ci:.2f}% | LR:"
+        f" {current_lr:.6f}"
     )
 
-    # 5. Checkpoint Saving (Clean graph_encoder prefix matching MultimodalFewShotNetwork)
-    if val_1shot > best_val_acc:
-      best_val_acc = val_1shot
+    if val_acc > best_val_acc:
+      best_val_acc = val_acc
       ckpt_path = os.path.join(save_dir, "checkpoints", "best_model.pth")
       torch.save(
           {
@@ -308,12 +274,18 @@ def run_pretraining(cfg, device):
           },
           ckpt_path,
       )
-      print(f"  -> [SAVED NEW BEST] Novel Val 1-Shot: {best_val_acc:.2f}%\n")
+      print(
+          f"  -> [SAVED NEW BEST] Novel Val {val_n_shot}-Shot:"
+          f" {best_val_acc:.2f}%\n"
+      )
 
   print("\n" + "=" * 80)
-  print(f"Pre-Training Complete! Peak Novel Val 1-Shot: {best_val_acc:.2f}%")
   print(
-      f"Best Model Saved to:"
+      f"Pre-Training Complete! Peak Novel Val {val_n_shot}-Shot:"
+      f" {best_val_acc:.2f}%"
+  )
+  print(
+      "Best Model Saved to:"
       f" {os.path.join(save_dir, 'checkpoints', 'best_model.pth')}"
   )
   print("=" * 80)
