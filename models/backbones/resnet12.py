@@ -150,6 +150,19 @@ class ResNet12(nn.Module):
         x = self.layer4(x)
         return x
 
+    def forward_stages(self, x):
+        """
+        Returns intermediate spatial feature maps for hypercolumn sampling:
+          1: (B, 64,  42, 42)
+          2: (B, 160, 21, 21)
+          3: (B, 320, 10, 10)
+          4: (B, 640, 5,  5)
+        """
+        f1 = self.layer1(x)
+        f2 = self.layer2(f1)
+        f3 = self.layer3(f2)
+        f4 = self.layer4(f3)
+        return {1: f1, 2: f2, 3: f3, 4: f4}
 
 def resnet12(keep_prob=0.9, block_size=5, **kwargs):
     """

@@ -44,6 +44,12 @@ class NormalizeShockGraph(BaseTransform):
             x = data.x.clone()
             device = x.device
 
+            # --- NEW: Preserve raw image-space (x, y, r) in [-1, 1] grid_sample coords ---
+            grid_x = (x[:, 0] / self.image_size) * 2.0 - 1.0
+            grid_y = (x[:, 1] / self.image_size) * 2.0 - 1.0
+            grid_r = (x[:, 2].abs() / self.image_size) * 2.0  # radius in [-1, 1] grid units
+            data.pos_xyr = torch.stack([grid_x, grid_y, grid_r], dim=-1)
+            
             if self.use_graph_local_norm:
                 # --- MODE 2: Per-Graph Normalization ---
                 # (a) Coordinates: Center and normalize by graph's own bounding radius

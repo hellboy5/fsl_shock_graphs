@@ -39,6 +39,10 @@ model:
   distance_metric: "cosine"     # Used when fsl_method == 'protonet'
   scale: 5.0                    # Logit multiplier (-scale * dist for GMN; scale * cos for ProtoNet)
   learnable_scale: false
+  hc_layers: [1, 2, 3]          # ResNet-12 stages to concat: e.g. [1, 2, 3], [1, 2, 3, 4], [2, 3], or int 3
+  hc_radius_mode: "disk_5pt"    # "none" | "concat_r" | "disk_5pt" | "disk_9pt" | "center_ring_concat"
+  hc_disk_scale: 0.7            # Multiplier on node radius r for disk ring offsets (0.7 * r)
+  hc_stage_l2norm: true         # L2-normalize each stage slice before concatenating across stages
 
 # Training Hyperparameters
 training:

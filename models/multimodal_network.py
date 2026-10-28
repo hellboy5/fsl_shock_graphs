@@ -23,15 +23,21 @@ class MultimodalFewShotNetwork(nn.Module):
     self.modality = cfg.model.modality
     self.fsl_method = cfg.model.fsl_method
 
-    # --- 1. Vision Pathway (Used for vision baseline or frozen RFS hypercolumns) ---
+    # --- 1. Vision Pathway (Used for vision baseline or frozen RFS/DeepEMD hypercolumns) ---
+    self.freeze_vision = bool(getattr(cfg.model, 'freeze_vision', False))
     if self.modality in ['vision', 'multimodal']:
       self.vision_encoder = VisionEncoder(
-          drop_rate=getattr(cfg.model, 'dropout', 0.1)
+          drop_rate=getattr(cfg.model, 'dropout', 0.1),
+          hc_layers=getattr(cfg.model, 'hc_layers', [1, 2, 3]),
+          hc_radius_mode=getattr(cfg.model, 'hc_radius_mode', 'disk_5pt'),
+          hc_disk_scale=float(getattr(cfg.model, 'hc_disk_scale', 0.7)),
+          hc_stage_l2norm=bool(getattr(cfg.model, 'hc_stage_l2norm', True)),
       )
       v_ckpt = getattr(cfg.model, 'vision_checkpoint', None)
       if v_ckpt:
-        self._load_submodule(self.vision_encoder, v_ckpt, 'vision_encoder')
-      if getattr(cfg.model, 'freeze_vision', False):
+        self.load_checkpoint(self.vision_encoder, v_ckpt, 'vision_encoder')
+      if self.freeze_vision:
+        self.vision_encoder.eval()
         for p in self.vision_encoder.parameters():
           p.requires_grad = False
         print('--> [MultimodalNetwork] Vision encoder frozen.')
@@ -40,6 +46,9 @@ class MultimodalFewShotNetwork(nn.Module):
     if self.modality in ['graph', 'multimodal']:
       g_hidden_dim = getattr(cfg.model, 'graph_hidden_dim', 128)
       g_proj_dim = getattr(cfg.model, 'graph_proj_dim', None) or g_hidden_dim
+      app_feat_dim = (
+          self.vision_encoder.hc_out_dim if self.modality == 'multimodal' else 0
+      )
 
       self.graph_encoder = GraphEncoder(
           node_feat_dim=cfg.model.node_feat_dim,
@@ -57,10 +66,11 @@ class MultimodalFewShotNetwork(nn.Module):
           use_reconstruction_dist=getattr(
               cfg.model, 'use_reconstruction_dist', True
           ),
+          app_feat_dim=app_feat_dim,
       )
       g_ckpt = getattr(cfg.model, 'graph_checkpoint', None)
       if g_ckpt:
-        self._load_submodule(self.graph_encoder, g_ckpt, 'graph_encoder')
+        self.load_checkpoint(self.graph_encoder, g_ckpt, 'graph_encoder')
       if getattr(cfg.model, 'freeze_graph', False):
         for p in self.graph_encoder.parameters():
           p.requires_grad = False
@@ -85,22 +95,40 @@ class MultimodalFewShotNetwork(nn.Module):
         learnable_scale=getattr(cfg.model, 'learnable_scale', False),
     )
 
-  def _load_submodule(self, module, path, target_name):
+  def train(self, mode: bool = True):
+    """Keeps frozen vision encoder BatchNorm and DropBlock in eval mode during training."""
+    super().train(mode)
+    if self.modality in ['vision', 'multimodal'] and self.freeze_vision:
+      self.vision_encoder.eval()
+    return self
+
+  def load_checkpoint(self, module, path, target_name):
     print(
         f'--> [MultimodalNetwork] Loading {target_name} weights from: {path}'
     )
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    state = ckpt.get('model_state_dict', ckpt)
+    state = ckpt
+    if isinstance(ckpt, dict):
+      for key in ('model_state_dict', 'params', 'model', 'state_dict', 'encoder'):
+        if key in ckpt and isinstance(ckpt[key], dict):
+          state = ckpt[key]
+          break
+
     target_dict = module.state_dict()
     matched = {}
 
     for k, v in state.items():
       clean_k = k
-      for prefix in [f'{target_name}.', 'model.', 'module.', 'encoder.']:
+      for prefix in [f'{target_name}.', 'model.', 'module.', 'encoder.', 'cnn.']:
         if clean_k.startswith(prefix):
           clean_k = clean_k[len(prefix) :]
       if clean_k in target_dict and v.shape == target_dict[clean_k].shape:
         matched[clean_k] = v
+      elif (
+          f'cnn.{clean_k}' in target_dict
+          and v.shape == target_dict[f'cnn.{clean_k}'].shape
+      ):
+        matched[f'cnn.{clean_k}'] = v
 
     target_dict.update(matched)
     module.load_state_dict(target_dict, strict=False)
@@ -109,15 +137,34 @@ class MultimodalFewShotNetwork(nn.Module):
         f' layers for {target_name}.'
     )
 
+  def attach_node_hypercolumns(self, vision_batch, graph_batch):
+    """Samples (x, y, r) hypercolumns from vision_batch onto graph_batch.x_app."""
+    with torch.set_grad_enabled(not self.freeze_vision):
+      x_app = self.vision_encoder.extract_hypercolumns(
+          vision_batch, graph_batch.pos_xyr, graph_batch.batch
+      )
+    graph_batch.x_app = x_app
+    if hasattr(graph_batch, '_slice_dict') and 'x' in graph_batch._slice_dict:
+      graph_batch._slice_dict['x_app'] = graph_batch._slice_dict['x'].clone()
+      graph_batch._inc_dict['x_app'] = torch.zeros_like(
+          graph_batch._inc_dict['x']
+      )
+    return graph_batch
+
   def extract_fused_features(self, vision_batch, graph_batch):
-    """Extracts 640D feature embeddings for unimodal ProtoNet evaluation."""
+    """Extracts feature embeddings for unimodal/multimodal ProtoNet evaluation."""
     if self.modality == 'vision':
       return self.vision_encoder(vision_batch)
+    if self.modality == 'multimodal':
+      graph_batch = self.attach_node_hypercolumns(vision_batch, graph_batch)
     return self.graph_encoder(graph_batch)
 
   def forward(self, vision_batch, graph_batch, n_way, k_shot):
     # --- GMN Branch: Pairwise Cross-Graph Matching & Set Reconstruction ---
     if self.fsl_method == 'gmn':
+      if self.modality == 'multimodal':
+        graph_batch = self.attach_node_hypercolumns(vision_batch, graph_batch)
+
       num_support = n_way * k_shot
       graph_list = graph_batch.to_data_list()
 
