@@ -8,8 +8,8 @@ num_test_classes: 20
 
 vision:
   image_size: 84
-  mean: [0.485, 0.456, 0.406]
-  std:  [0.229, 0.224, 0.225]
+  mean: [0.4914, 0.4824, 0.4467]
+  std:  [0.2471, 0.2435, 0.2616]
 
 graph:
   # SWITCH: true for coarsened (*_coarse.pt), false for uncoarsened (*.pt)
