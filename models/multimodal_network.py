@@ -35,7 +35,9 @@ class MultimodalFewShotNetwork(nn.Module):
       )
       v_ckpt = getattr(cfg.model, 'vision_checkpoint', None)
       if v_ckpt:
-        self.load_checkpoint(self.vision_encoder, v_ckpt, 'vision_encoder')
+        self.load_checkpoint(
+            self.vision_encoder.cnn, v_ckpt, 'vision_encoder.cnn'
+        )
       if self.freeze_vision:
         self.vision_encoder.eval()
         for p in self.vision_encoder.parameters():
@@ -114,14 +116,46 @@ class MultimodalFewShotNetwork(nn.Module):
           state = ckpt[key]
           break
 
-    target_dict = module.state_dict()
-    matched = {}
+    prefixes = (
+        f'{target_name}.',
+        'vision_encoder.cnn.',
+        'vision_encoder.',
+        'graph_encoder.',
+        'feature_extractor.',
+        'model.',
+        'module.',
+        'encoder.',
+        'features.',
+        'cnn.',
+        'backbone.',
+    )
 
+    raw_clean = {}
     for k, v in state.items():
+      if any(
+          skip in k
+          for skip in ('classifier', 'fc', 'linear', 'num_batches_tracked')
+      ):
+        continue
       clean_k = k
-      for prefix in [f'{target_name}.', 'model.', 'module.', 'encoder.', 'cnn.']:
-        if clean_k.startswith(prefix):
-          clean_k = clean_k[len(prefix) :]
+      changed = True
+      while changed:
+        changed = False
+        for prefix in prefixes:
+          if clean_k.startswith(prefix):
+            clean_k = clean_k[len(prefix) :]
+            changed = True
+      raw_clean[clean_k] = v
+
+    target_dict = {
+        k: v
+        for k, v in module.state_dict().items()
+        if 'num_batches_tracked' not in k
+    }
+
+    matched = {}
+    # Pass 1: Direct key-name match
+    for clean_k, v in raw_clean.items():
       if clean_k in target_dict and v.shape == target_dict[clean_k].shape:
         matched[clean_k] = v
       elif (
@@ -130,8 +164,17 @@ class MultimodalFewShotNetwork(nn.Module):
       ):
         matched[f'cnn.{clean_k}'] = v
 
-    target_dict.update(matched)
-    module.load_state_dict(target_dict, strict=False)
+    # Pass 2: Ordered tensor shape match fallback
+    if len(matched) < len(target_dict):
+      raw_vals = list(raw_clean.values())
+      tgt_keys = list(target_dict.keys())
+      if len(raw_vals) == len(tgt_keys) and all(
+          raw_vals[i].shape == target_dict[tgt_keys[i]].shape
+          for i in range(len(tgt_keys))
+      ):
+        matched = dict(zip(tgt_keys, raw_vals))
+
+    module.load_state_dict(matched, strict=False)
     print(
         f'--> [MultimodalNetwork] Loaded {len(matched)} / {len(target_dict)}'
         f' layers for {target_name}.'

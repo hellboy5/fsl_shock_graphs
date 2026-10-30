@@ -121,6 +121,9 @@ def validate_few_shot(encoder, val_loader, n_way, n_shot, n_query, device):
 
 # 6. Main Pre-Training Function
 def run_pretraining(cfg, device):
+  # Stage 1 pre-training only trains the Siamese backbone; lock saved cfg to protonet for eval.py
+  cfg.model.fsl_method = "protonet"
+  
   save_dir = cfg.training.save_dir
   os.makedirs(os.path.join(save_dir, "checkpoints"), exist_ok=True)
 
