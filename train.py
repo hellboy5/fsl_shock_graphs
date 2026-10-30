@@ -112,7 +112,7 @@ def run_training(cfg, device):
 
   # --- Warm-Start Checkpoint Loading ---
   ckpt_path = getattr(cfg, 'checkpoint_path', None)
-  has_loaded_checkpoint = False
+  has_loaded_checkpoint = bool(getattr(cfg.model, 'graph_checkpoint', None))
 
   if ckpt_path:
     print(f'--> [Warm-Start] Loading pre-trained weights from: {ckpt_path}')
@@ -165,7 +165,10 @@ def run_training(cfg, device):
     for name, param in model.named_parameters():
       if not param.requires_grad:
         continue
-      if "proj_match" in name or "node_update" in name:
+      if any(
+          k in name
+          for k in ("proj_match", "node_update", "app_", "film_", "zero_")
+      ):
         matching_params.append(param)
       else:
         backbone_params.append(param)
@@ -283,6 +286,6 @@ def run_training(cfg, device):
           },
           os.path.join(save_dir, 'checkpoints', 'best_model.pth'),
       )
-      print(f'  -> New Best Model Saved! ({best_val_acc:.2f}%)', flush=True)
+      print(f' -> New Best Model Saved! ({best_val_acc:.2f}%)', flush=True)
 
     scheduler.step()
