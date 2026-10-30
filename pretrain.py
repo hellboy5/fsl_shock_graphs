@@ -78,7 +78,7 @@ class GraphClassificationModel(nn.Module):
             cfg.model, "use_reconstruction_dist", True
         ),
     )
-    scale = float(getattr(cfg.model, "scale", 16.0))
+    scale = float(getattr(cfg.model, "pretrain_scale", 10.0))
     self.classifier = NormalizedLinear(g_proj_dim, num_classes, scale=scale)
 
   def forward(self, graph_batch):

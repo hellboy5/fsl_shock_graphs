@@ -37,6 +37,7 @@ model:
   use_jk: true
   use_reconstruction_dist: true # true = Unpooled Set Reconstruction, false = Global Pooled cdist
   distance_metric: "cosine"     # Used when fsl_method == 'protonet'
+  pretrain_scale: 10.0          # Cosine logit multiplier (scale * cos)
   scale: 5.0                    # Logit multiplier (-scale * dist for GMN; scale * cos for ProtoNet)
   learnable_scale: false
   hc_layers: [1, 2, 3]          # ResNet-12 stages to concat: e.g. [1, 2, 3], [1, 2, 3, 4], [2, 3], or int 3
