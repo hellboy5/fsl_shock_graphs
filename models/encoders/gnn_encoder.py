@@ -14,49 +14,60 @@ def compute_pairwise_seed_residuals(
     N_query,
     N_support,
     scale,
+    a1_seeds=None,
+    a2_seeds=None,
+    app_match_logit=None,
 ):
-  """Computes isolated pairwise cross-attention residuals strictly within each (q, s) pair.
-
-  Uses L2-normalized keypoint similarity for stability and contracts candidate
-  weights before feature retrieval to avoid 4D [N_q, N_s, K, D] memory overhead.
-  """
+  """Computes isolated pairwise cross-attention residuals strictly within each (q, s) pair."""
   H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
 
-  # L2-normalize for bounded, stable cosine attention scores across all layers
   H_q_norm = F.normalize(H_q, p=2, dim=-1)
   H_s_norm = F.normalize(H_s, p=2, dim=-1)
 
   # Pairwise cosine similarity strictly between Query q and Support s: [N_q, N_s, K_q, K_s]
   cos_sim = torch.einsum("qid, sjd -> qsij", H_q_norm, H_s_norm)
+
+  # Option 4: Appearance-Guided Cross-Graph Seed Matching
+  if (
+      a1_seeds is not None
+      and a2_seeds is not None
+      and app_match_logit is not None
+  ):
+    A_q, _ = to_dense_batch(a1_seeds, batch1_seeds, batch_size=N_query)
+    A_s, _ = to_dense_batch(a2_seeds, batch2_seeds, batch_size=N_support)
+    A_q_norm = F.normalize(A_q, p=2, dim=-1)
+    A_s_norm = F.normalize(A_s, p=2, dim=-1)
+    app_cos_sim = torch.einsum("qid, sjd -> qsij", A_q_norm, A_s_norm)
+    w_app = torch.sigmoid(app_match_logit)
+    cos_sim = (1.0 - w_app) * cos_sim + w_app * app_cos_sim
+
   scores = cos_sim * 5.0
 
-  # 1. Query -> Support attention (softmax strictly over Support graph s's keypoints)
+  # 1. Query -> Support attention
   scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
   a12 = torch.nan_to_num(F.softmax(scores_q2s, dim=-1), nan=0.0)
 
-  # Weight support candidates by mean keypoint cosine match similarity: [N_q, N_s]
   q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
   pair_sim_q = (
       ((cos_sim * a12).sum(dim=-1) * M_q.unsqueeze(1)).sum(dim=-1) / q_counts
   )
-  w_q2s = F.softmax(pair_sim_q * 5.0, dim=-1)  # [N_q, N_s]
+  w_q2s = F.softmax(pair_sim_q * 5.0, dim=-1)
 
-  # Contract (w_q2s * a12) with H_s directly -> [N_q, K_q, D]
   a12_weighted = w_q2s.unsqueeze(-1).unsqueeze(-1) * a12
   retrieved2 = torch.einsum("qsij, sjd -> qid", a12_weighted, H_s)
   mu1_dense = H_q - retrieved2
   mu1_seeds = mu1_dense[M_q]
 
-  # 2. Support -> Query attention (softmax strictly over Query graph q's keypoints)
+  # 2. Support -> Query attention
   scores_s2q = scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9)
   a21 = torch.nan_to_num(F.softmax(scores_s2q, dim=-2), nan=0.0)
 
-  s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)  # Shape: [1, N_s]
+  s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
   pair_sim_s = (
       ((cos_sim * a21).sum(dim=-2) * M_s.unsqueeze(0)).sum(dim=-1) / s_counts
   )
-  w_s2q = F.softmax(pair_sim_s * 5.0, dim=0)  # [N_q, N_s]
+  w_s2q = F.softmax(pair_sim_s * 5.0, dim=0)
 
   a21_weighted = w_s2q.unsqueeze(-1).unsqueeze(-1) * a21
   retrieved1 = torch.einsum("qsij, qid -> sjd", a21_weighted, H_q)
@@ -77,65 +88,68 @@ def compute_cross_transformer_reconstruction_distance(
     N_support,
     projector=None,
     scale=None,
+    x1_app=None,
+    x2_app=None,
+    app_recon_proj=None,
 ):
-  """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance.
-
-  1. Projects keypoints through Stage 1's `self.projector` (Linear + BatchNorm1d)
-     to center the positive ReLU activations and prevent constant-vector mode collapse.
-  2. Evaluates expected squared Euclidean distance on the unit sphere (2 - 2 * cos_sim)
-     without Jensen norm shrinkage or 4D feature reconstruction tensors.
-  """
+  """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
   h1_seeds = h1_final[mask1]
   h2_seeds = h2_final[mask2]
   batch1_seeds = batch1[mask1]
   batch2_seeds = batch2[mask2]
 
-  # Map seed nodes through Stage 1's Linear + BatchNorm1d projector to center channels & prevent collapse
   if projector is not None and h1_seeds.size(-1) == projector[0].in_features:
     all_seeds = torch.cat([h1_seeds, h2_seeds], dim=0)
     proj_seeds = projector(all_seeds)
     h1_seeds = proj_seeds[: h1_seeds.size(0)]
     h2_seeds = proj_seeds[h1_seeds.size(0) :]
 
+  # Option 5: Late Set-Reconstruction Keypoint Residual Fusion
+  if (
+      app_recon_proj is not None
+      and x1_app is not None
+      and x2_app is not None
+  ):
+    x1_app_seeds = x1_app[mask1]
+    x2_app_seeds = x2_app[mask2]
+    all_app_seeds = torch.cat([x1_app_seeds, x2_app_seeds], dim=0)
+    proj_app_seeds = app_recon_proj(all_app_seeds)
+    h1_seeds = h1_seeds + proj_app_seeds[: h1_seeds.size(0)]
+    h2_seeds = h2_seeds + proj_app_seeds[h1_seeds.size(0) :]
+
   H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
 
-  # Unit-normalize centered 640D keypoint descriptors: ||h_i|| = 1, ||h_j|| = 1
   H_q = F.normalize(H_q, p=2, dim=-1)
   H_s = F.normalize(H_s, p=2, dim=-1)
 
-  # Pairwise cosine similarity in [-1, 1] and squared Euclidean distance in [0, 4]
   cos_sim = torch.einsum("qid, sjd -> qsij", H_q, H_s)
-  pair_dist_sq = 2.0 - 2.0 * cos_sim  # ||h_i^q - h_j^s||^2 on the unit sphere
+  pair_dist_sq = 2.0 - 2.0 * cos_sim
   scores = cos_sim * 10.0
 
-  # Direction 1: Query keypoints matched against Support s keypoints
+  # Direction 1: Query -> Support
   scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
   A_q2s = torch.nan_to_num(F.softmax(scores_q2s, dim=-1), nan=0.0)
 
-  err_q = (A_q2s * pair_dist_sq).sum(dim=-1)  # [N_query, N_support, K_max_q]
+  err_q = (A_q2s * pair_dist_sq).sum(dim=-1)
   err_q = err_q.masked_fill(~M_q.unsqueeze(1), 0.0)
   K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
-  dist_q2s = err_q.sum(dim=-1) / K_q_counts  # [N_query, N_support]
+  dist_q2s = err_q.sum(dim=-1) / K_q_counts
 
-  # Direction 2: Support keypoints matched against Query q keypoints (Symmetric term)
+  # Direction 2: Support -> Query
   scores_s2q = scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9)
   A_s2q = torch.nan_to_num(F.softmax(scores_s2q, dim=-2), nan=0.0)
 
-  err_s = (A_s2q * pair_dist_sq).sum(dim=-2)  # [N_query, N_support, K_max_s]
+  err_s = (A_s2q * pair_dist_sq).sum(dim=-2)
   err_s = err_s.masked_fill(~M_s.unsqueeze(0), 0.0)
   K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
-  dist_s2q = err_s.sum(dim=-1) / K_s_counts  # [N_query, N_support]
+  dist_s2q = err_s.sum(dim=-1) / K_s_counts
 
   return 0.5 * (dist_q2s + dist_s2q)
 
 
 class GraphEncoder(nn.Module):
-  """GINE & Graph Matching Network (GMN) Backbone for Shock Graphs.
-
-  Supports Stage 1 unimodal representation learning (`forward`) and
-  Stage 2 pairwise cross-graph matching with set reconstruction (`forward_gmn`).
-  """
+  """GINE & Graph Matching Network (GMN) Backbone with Modular Visual Hypercolumn Fusion."""
 
   def __init__(
       self,
@@ -152,6 +166,13 @@ class GraphEncoder(nn.Module):
       use_input_mlp=True,
       use_jk=True,
       use_reconstruction_dist=True,
+      app_feat_dim=0,
+      app_node_scope="all",
+      use_app_node_input=True,
+      use_app_edges=False,
+      use_app_film=False,
+      use_app_cross_match=False,
+      use_app_recon_fusion=False,
       **kwargs,
   ):
     super(GraphEncoder, self).__init__()
@@ -159,9 +180,22 @@ class GraphEncoder(nn.Module):
     self.use_jk = use_jk
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
+    self.proj_feat_dim = proj_feat_dim
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)
     self.use_reconstruction_dist = use_reconstruction_dist
+
+    self.app_feat_dim = int(app_feat_dim)
+    self.app_node_scope = str(app_node_scope).lower()
+    self.use_app_node_input = bool(use_app_node_input) and self.app_feat_dim > 0
+    self.use_app_edges = bool(use_app_edges) and self.app_feat_dim > 0
+    self.use_app_film = bool(use_app_film) and self.app_feat_dim > 0
+    self.use_app_cross_match = (
+        bool(use_app_cross_match) and self.app_feat_dim > 0
+    )
+    self.use_app_recon_fusion = (
+        bool(use_app_recon_fusion) and self.app_feat_dim > 0
+    )
 
     effective_dim = (hidden_dim * num_layers) if use_jk else hidden_dim
 
@@ -216,7 +250,7 @@ class GraphEncoder(nn.Module):
       elif norm_type == "batch":
         self.norms.append(nn.BatchNorm1d(hidden_dim))
 
-    # 3. Pooling / Readout Setup ('mean' or 'global_attention')
+    # 3. Pooling / Readout Setup
     if self.pooling_method == "global_attention":
       gate_nn = nn.Sequential(
           nn.Linear(effective_dim, effective_dim // 2),
@@ -231,7 +265,7 @@ class GraphEncoder(nn.Module):
         nn.BatchNorm1d(proj_feat_dim),
     )
 
-    # 5. GMN Cross-Graph Matching Heads (Zero-init final layer so Step 0 == Pre-trained GINE)
+    # 5. GMN Cross-Graph Matching Heads
     self.proj_match = nn.Linear(hidden_dim, hidden_dim)
     self.node_update = nn.Sequential(
         nn.Linear(hidden_dim * 2, hidden_dim),
@@ -241,14 +275,94 @@ class GraphEncoder(nn.Module):
     nn.init.zeros_(self.node_update[-1].weight)
     nn.init.zeros_(self.node_update[-1].bias)
 
+    # 6. Modular Visual Appearance Fusion Heads (All prefixed with `app_` for 1e-3 LR routing)
+    needs_app_stem = (
+        self.use_app_node_input
+        or self.use_app_edges
+        or self.use_app_film
+        or self.use_app_cross_match
+    )
+    if needs_app_stem:
+      self.app_input_mlp = nn.Sequential(
+          nn.LayerNorm(self.app_feat_dim),
+          nn.Linear(self.app_feat_dim, hidden_dim),
+          nn.GELU(),
+          nn.Dropout(dropout),
+          nn.Linear(hidden_dim, hidden_dim),
+          nn.LayerNorm(hidden_dim),
+          nn.GELU(),
+      )
+
+    if self.use_app_node_input:
+      self.app_node_gate = nn.Linear(hidden_dim, hidden_dim)
+      nn.init.zeros_(self.app_node_gate.weight)
+      nn.init.zeros_(self.app_node_gate.bias)
+
+    if self.use_app_edges:
+      self.app_edge_mlp = nn.Sequential(
+          nn.Linear(hidden_dim * 2, hidden_dim),
+          nn.LayerNorm(hidden_dim),
+          nn.GELU(),
+          nn.Linear(hidden_dim, hidden_dim),
+      )
+      nn.init.zeros_(self.app_edge_mlp[-1].weight)
+      nn.init.zeros_(self.app_edge_mlp[-1].bias)
+
+    if self.use_app_film:
+      self.app_film_layers = nn.ModuleList(
+          [nn.Linear(hidden_dim, hidden_dim * 2) for _ in range(num_layers)]
+      )
+      for film_lin in self.app_film_layers:
+        nn.init.zeros_(film_lin.weight)
+        nn.init.zeros_(film_lin.bias)
+
+    if self.use_app_cross_match:
+      self.app_match_logit = nn.Parameter(torch.tensor(0.0))
+
+    if self.use_app_recon_fusion:
+      self.app_recon_proj = nn.Sequential(
+          nn.LayerNorm(self.app_feat_dim),
+          nn.Linear(self.app_feat_dim, proj_feat_dim),
+          nn.GELU(),
+          nn.Dropout(dropout),
+          nn.Linear(proj_feat_dim, proj_feat_dim),
+      )
+      nn.init.zeros_(self.app_recon_proj[-1].weight)
+      nn.init.zeros_(self.app_recon_proj[-1].bias)
+
   def _apply_pooling(self, x_final, batch):
-    """Applies 'mean' or 'global_attention' pooling to produce a single graph vector."""
     if self.pooling_method == "global_attention":
       return self.pool_op(x_final, batch)
     return global_mean_pool(x_final, batch)
 
+  def _encode_appearance(self, data, deg=None):
+    if (
+        self.app_feat_dim <= 0
+        or not hasattr(data, "x_app")
+        or data.x_app is None
+    ):
+      return None, None
+
+    x_app = data.x_app
+    a = self.app_input_mlp(x_app) if hasattr(self, "app_input_mlp") else None
+
+    if self.app_node_scope == "seeds_only":
+      if deg is None:
+        deg = degree(data.edge_index[0], num_nodes=data.x.size(0))
+      seed_mask = ((deg == 1) | (deg >= 3)).unsqueeze(-1)
+      x_app = x_app * seed_mask.type_as(x_app)
+      if a is not None:
+        a = a * seed_mask.type_as(a)
+
+    return a, x_app
+
+  def _compute_edge_appearance(self, a, edge_index):
+    src, dst = edge_index[0], edge_index[1]
+    a_mean = 0.5 * (a[src] + a[dst])
+    a_diff = torch.abs(a[src] - a[dst])
+    return self.app_edge_mlp(torch.cat([a_mean, a_diff], dim=-1))
+
   def forward(self, data):
-    """Standard forward pass on a single graph or batch (Stage 1 Pre-Training / ProtoNet)."""
     x, edge_index, edge_attr, batch = (
         data.x,
         data.edge_index,
@@ -256,8 +370,16 @@ class GraphEncoder(nn.Module):
         data.batch,
     )
 
+    deg = degree(edge_index[0], num_nodes=x.size(0))
+    a, x_app = self._encode_appearance(data, deg=deg)
+
     x = self.node_encoder(x)
     edge_attr = self.edge_encoder(edge_attr)
+
+    if self.use_app_node_input and a is not None:
+      x = x + self.app_node_gate(a)
+    if self.use_app_edges and a is not None:
+      edge_attr = edge_attr + self._compute_edge_appearance(a, edge_index)
 
     layer_outputs = []
     for i, layer in enumerate(self.layers):
@@ -268,6 +390,9 @@ class GraphEncoder(nn.Module):
           if isinstance(self.norms[i], GraphNorm)
           else self.norms[i](x)
       )
+      if self.use_app_film and a is not None:
+        gamma, beta = self.app_film_layers[i](a).chunk(2, dim=-1)
+        x = (1.0 + gamma) * x + beta
       x = F.relu(x)
       x = x + x_in
 
@@ -276,10 +401,14 @@ class GraphEncoder(nn.Module):
 
     x_final = torch.cat(layer_outputs, dim=-1) if self.use_jk else x
     pooled = self._apply_pooling(x_final, batch)
-    return self.projector(pooled)
+    out = self.projector(pooled)
+
+    if self.use_app_recon_fusion and x_app is not None:
+      out = out + self.app_recon_proj(global_mean_pool(x_app, batch))
+
+    return out
 
   def forward_gmn(self, g1, g2):
-    """Stage 2 GMN forward pass: Joint cross-graph propagation & set reconstruction distance."""
     x1, edge_index1, edge_attr1 = g1.x, g1.edge_index, g1.edge_attr
     x2, edge_index2, edge_attr2 = g2.x, g2.edge_index, g2.edge_attr
 
@@ -320,8 +449,33 @@ class GraphEncoder(nn.Module):
     if not mask2.any():
       mask2 = torch.ones_like(mask2)
 
+    a1, x1_app = self._encode_appearance(g1, deg=deg1)
+    a2, x2_app = self._encode_appearance(g2, deg=deg2)
+
+    if self.use_app_node_input and a1 is not None and a2 is not None:
+      h1 = h1 + self.app_node_gate(a1)
+      h2 = h2 + self.app_node_gate(a2)
+
+    if self.use_app_edges and a1 is not None and a2 is not None:
+      e1 = e1 + self._compute_edge_appearance(a1, edge_index1)
+      e2 = e2 + self._compute_edge_appearance(a2, edge_index2)
+
     batch1_seeds = batch1[mask1]
     batch2_seeds = batch2[mask2]
+
+    a1_seeds = (
+        a1[mask1]
+        if (self.use_app_cross_match and a1 is not None)
+        else None
+    )
+    a2_seeds = (
+        a2[mask2]
+        if (self.use_app_cross_match and a2 is not None)
+        else None
+    )
+    app_match_logit = (
+        self.app_match_logit if self.use_app_cross_match else None
+    )
 
     layer_outputs1 = []
     layer_outputs2 = []
@@ -330,7 +484,6 @@ class GraphEncoder(nn.Module):
       h1_in = h1
       h2_in = h2
 
-      # A. Intra-graph GINE message passing
       h1 = layer(h1, edge_index1, edge_attr=e1)
       h2 = layer(h2, edge_index2, edge_attr=e2)
 
@@ -345,10 +498,15 @@ class GraphEncoder(nn.Module):
           else self.norms[i](h2)
       )
 
+      if self.use_app_film and a1 is not None and a2 is not None:
+        gamma1, beta1 = self.app_film_layers[i](a1).chunk(2, dim=-1)
+        gamma2, beta2 = self.app_film_layers[i](a2).chunk(2, dim=-1)
+        h1 = (1.0 + gamma1) * h1 + beta1
+        h2 = (1.0 + gamma2) * h2 + beta2
+
       h1 = F.relu(h1) + h1_in
       h2 = F.relu(h2) + h2_in
 
-      # B. Isolated Pairwise Inter-graph Cross-Attention Matching (GMN)
       h1_seeds = h1[mask1]
       h2_seeds = h2[mask2]
 
@@ -360,9 +518,11 @@ class GraphEncoder(nn.Module):
           N_query,
           N_support,
           self.scale,
+          a1_seeds=a1_seeds,
+          a2_seeds=a2_seeds,
+          app_match_logit=app_match_logit,
       )
 
-      # C. Additive residual update strictly on seed keypoints
       delta1 = torch.zeros_like(h1)
       delta2 = torch.zeros_like(h2)
       delta1[mask1] = self.node_update(
@@ -394,12 +554,22 @@ class GraphEncoder(nn.Module):
           N_support=N_support,
           projector=self.projector,
           scale=self.scale,
+          x1_app=x1_app if self.use_app_recon_fusion else None,
+          x2_app=x2_app if self.use_app_recon_fusion else None,
+          app_recon_proj=(
+              self.app_recon_proj if self.use_app_recon_fusion else None
+          ),
       )
       return dist, None, None
     else:
       pooled1 = self._apply_pooling(h1_final, batch1)
       pooled2 = self._apply_pooling(h2_final, batch2)
-      z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
-      z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
+      z1 = self.projector(pooled1)
+      z2 = self.projector(pooled2)
+      if self.use_app_recon_fusion and x1_app is not None and x2_app is not None:
+        z1 = z1 + self.app_recon_proj(global_mean_pool(x1_app, batch1))
+        z2 = z2 + self.app_recon_proj(global_mean_pool(x2_app, batch2))
+      z1_norm = F.normalize(z1, p=2, dim=-1)
+      z2_norm = F.normalize(z2, p=2, dim=-1)
       dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
       return dist, z1_norm, z2_norm

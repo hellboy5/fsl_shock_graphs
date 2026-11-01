@@ -69,6 +69,14 @@ class MultimodalFewShotNetwork(nn.Module):
               cfg.model, 'use_reconstruction_dist', True
           ),
           app_feat_dim=app_feat_dim,
+          app_node_scope=getattr(cfg.model, 'app_node_scope', 'all'),
+          use_app_node_input=getattr(cfg.model, 'use_app_node_input', True),
+          use_app_edges=getattr(cfg.model, 'use_app_edges', False),
+          use_app_film=getattr(cfg.model, 'use_app_film', False),
+          use_app_cross_match=getattr(cfg.model, 'use_app_cross_match', False),
+          use_app_recon_fusion=getattr(
+              cfg.model, 'use_app_recon_fusion', False
+          ),
       )
       g_ckpt = getattr(cfg.model, 'graph_checkpoint', None)
       if g_ckpt:
