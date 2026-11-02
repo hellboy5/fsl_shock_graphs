@@ -70,6 +70,7 @@ class MultimodalFewShotNetwork(nn.Module):
           ),
           app_feat_dim=app_feat_dim,
           app_node_scope=getattr(cfg.model, 'app_node_scope', 'all'),
+          recon_node_scope=getattr(cfg.model, 'recon_node_scope', 'all'),
           app_dropout=getattr(cfg.model, 'app_dropout', 0.2),
           use_app_node_input=getattr(cfg.model, 'use_app_node_input', True),
           use_app_edges=getattr(cfg.model, 'use_app_edges', False),

@@ -49,6 +49,7 @@ model:
 
   # --- Multimodal Appearance Fusion Toggles ---
   app_node_scope: "all"           # "all" (all graph nodes) | "seeds_only" (only deg==1 or deg>=3)
+  recon_node_scope: "all"         # "all" (all nodes in final dist_recon) | "seeds_only" (only deg==1 or deg>=3)
   app_dropout: 0.35               # Drop appearance on 20% of graphs during training to prevent modality collapse
   use_app_node_input: true        # Option 1: Add zero-init appearance residual to initial node features
   use_app_edges: false            # Option 2: Add zero-init edge appearance contrast |a_u - a_v| to edges

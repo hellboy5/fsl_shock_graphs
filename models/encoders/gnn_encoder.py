@@ -76,7 +76,6 @@ def compute_pairwise_seed_residuals(
 
   return mu1_seeds, mu2_seeds
 
-
 def compute_cross_transformer_reconstruction_distance(
     h1_final,
     h2_final,
@@ -90,8 +89,8 @@ def compute_cross_transformer_reconstruction_distance(
     scale=None,
     x1_app=None,
     x2_app=None,
-    app_recon_proj=None,
     app_recon_alpha=None,
+    query_chunk_size=25,
 ):
   """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
   h1_seeds = h1_final[mask1]
@@ -105,59 +104,71 @@ def compute_cross_transformer_reconstruction_distance(
     h1_seeds = proj_seeds[: h1_seeds.size(0)]
     h2_seeds = proj_seeds[h1_seeds.size(0) :]
 
-  # Option 5: Late Set-Reconstruction Keypoint Residual Fusion
-  if (
-      app_recon_proj is not None
-      and app_recon_alpha is not None
-      and x1_app is not None
-      and x2_app is not None
-  ):
-    x1_app_seeds = x1_app[mask1]
-    x2_app_seeds = x2_app[mask2]
-    all_app_seeds = torch.cat([x1_app_seeds, x2_app_seeds], dim=0)
-    proj_app_seeds = app_recon_proj(all_app_seeds)
-
-    h1_seeds = F.normalize(h1_seeds, p=2, dim=-1)
-    h2_seeds = F.normalize(h2_seeds, p=2, dim=-1)
-    app1 = F.normalize(proj_app_seeds[: h1_seeds.size(0)], p=2, dim=-1)
-    app2 = F.normalize(proj_app_seeds[h1_seeds.size(0) :], p=2, dim=-1)
-    gate = torch.tanh(app_recon_alpha)
-
-    active1 = (x1_app_seeds.abs().sum(dim=-1, keepdim=True) > 0).type_as(app1)
-    active2 = (x2_app_seeds.abs().sum(dim=-1, keepdim=True) > 0).type_as(app2)
-
-    h1_seeds = h1_seeds + gate * app1 * active1
-    h2_seeds = h2_seeds + gate * app2 * active2
-
-  H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
+  H_q_all, M_q_all = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
 
-  H_q = F.normalize(H_q, p=2, dim=-1)
+  H_q_all = F.normalize(H_q_all, p=2, dim=-1)
   H_s = F.normalize(H_s, p=2, dim=-1)
 
-  cos_sim = torch.einsum("qid, sjd -> qsij", H_q, H_s)
-  pair_dist_sq = 2.0 - 2.0 * cos_sim
-  scores = cos_sim * 10.0
+  use_late_app = (
+      app_recon_alpha is not None
+      and x1_app is not None
+      and x2_app is not None
+  )
+  if use_late_app:
+    X_q_all, _ = to_dense_batch(x1_app[mask1], batch1_seeds, batch_size=N_query)
+    X_s_app, _ = to_dense_batch(x2_app[mask2], batch2_seeds, batch_size=N_support)
+    q_active_all = X_q_all.abs().sum(dim=(-2, -1)) > 0
+    s_active = X_s_app.abs().sum(dim=(-2, -1)) > 0
+    X_q_all = F.normalize(X_q_all, p=2, dim=-1)
+    X_s_app = F.normalize(X_s_app, p=2, dim=-1)
+    w_recon = torch.sigmoid(app_recon_alpha)
 
-  # Direction 1: Query -> Support
-  scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
-  A_q2s = torch.nan_to_num(F.softmax(scores_q2s, dim=-1), nan=0.0)
-
-  err_q = (A_q2s * pair_dist_sq).sum(dim=-1)
-  err_q = err_q.masked_fill(~M_q.unsqueeze(1), 0.0)
-  K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
-  dist_q2s = err_q.sum(dim=-1) / K_q_counts
-
-  # Direction 2: Support -> Query
-  scores_s2q = scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9)
-  A_s2q = torch.nan_to_num(F.softmax(scores_s2q, dim=-2), nan=0.0)
-
-  err_s = (A_s2q * pair_dist_sq).sum(dim=-2)
-  err_s = err_s.masked_fill(~M_s.unsqueeze(0), 0.0)
   K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
-  dist_s2q = err_s.sum(dim=-1) / K_s_counts
+  dist_chunks = []
 
-  return 0.5 * (dist_q2s + dist_s2q)
+  # Process queries in chunks of 25 so 4D [chunk, N_s, L_q, L_s] tensors never OOM on 1000-node graphs
+  for q0 in range(0, N_query, query_chunk_size):
+    q1 = min(q0 + query_chunk_size, N_query)
+    H_q = H_q_all[q0:q1]
+    M_q = M_q_all[q0:q1]
+
+    cos_sim = torch.einsum("qid, sjd -> qsij", H_q, H_s)
+
+    if use_late_app:
+      app_cos_sim = torch.einsum("qid, sjd -> qsij", X_q_all[q0:q1], X_s_app)
+      pair_active = (
+          (q_active_all[q0:q1].unsqueeze(1) & s_active.unsqueeze(0))
+          .unsqueeze(-1)
+          .unsqueeze(-1)
+      )
+      blended_cos = (1.0 - w_recon) * cos_sim + w_recon * app_cos_sim
+      cos_sim = torch.where(pair_active, blended_cos, cos_sim)
+
+    scores = cos_sim * 10.0
+
+    # Direction 1: Query -> Support
+    A_q2s = torch.nan_to_num(
+        F.softmax(scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9), dim=-1),
+        nan=0.0,
+    )
+    err_q = 2.0 - 2.0 * (A_q2s * cos_sim).sum(dim=-1)
+    err_q = err_q.masked_fill(~M_q.unsqueeze(1), 0.0)
+    K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    dist_q2s = err_q.sum(dim=-1) / K_q_counts
+
+    # Direction 2: Support -> Query
+    A_s2q = torch.nan_to_num(
+        F.softmax(scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9), dim=-2),
+        nan=0.0,
+    )
+    err_s = 2.0 - 2.0 * (A_s2q * cos_sim).sum(dim=-2)
+    err_s = err_s.masked_fill(~M_s.unsqueeze(0), 0.0)
+    dist_s2q = err_s.sum(dim=-1) / K_s_counts
+
+    dist_chunks.append(0.5 * (dist_q2s + dist_s2q))
+
+  return torch.cat(dist_chunks, dim=0)
 
 
 class GraphEncoder(nn.Module):
@@ -180,6 +191,7 @@ class GraphEncoder(nn.Module):
       use_reconstruction_dist=True,
       app_feat_dim=0,
       app_node_scope="all",
+      recon_node_scope="all",
       app_dropout=0.2,
       use_app_node_input=True,
       use_app_edges=False,
@@ -200,6 +212,7 @@ class GraphEncoder(nn.Module):
 
     self.app_feat_dim = int(app_feat_dim)
     self.app_node_scope = str(app_node_scope).lower()
+    self.recon_node_scope = str(recon_node_scope).lower()
     self.app_dropout = float(app_dropout)
     self.use_app_node_input = bool(use_app_node_input) and self.app_feat_dim > 0
     self.use_app_edges = bool(use_app_edges) and self.app_feat_dim > 0
@@ -289,7 +302,7 @@ class GraphEncoder(nn.Module):
     nn.init.zeros_(self.node_update[-1].weight)
     nn.init.zeros_(self.node_update[-1].bias)
 
-    # 6. Modular Visual Appearance Fusion Heads (All prefixed with `app_` for 1e-3 LR routing)
+    # 6. Modular Visual Appearance Fusion Heads (All prefixed with `app_` for LR routing)
     needs_app_stem = (
         self.use_app_node_input
         or self.use_app_edges
@@ -336,12 +349,7 @@ class GraphEncoder(nn.Module):
       self.app_match_logit = nn.Parameter(torch.tensor(0.0))
 
     if self.use_app_recon_fusion:
-      self.app_recon_proj = nn.Sequential(
-          nn.LayerNorm(self.app_feat_dim),
-          nn.Dropout(dropout),
-          nn.Linear(self.app_feat_dim, proj_feat_dim, bias=False),
-      )
-      self.app_recon_alpha = nn.Parameter(torch.zeros(1, proj_feat_dim))
+      self.app_recon_alpha = nn.Parameter(torch.tensor(0.0))
 
   def _apply_pooling(self, x_final, batch):
     if self.pooling_method == "global_attention":
@@ -429,12 +437,11 @@ class GraphEncoder(nn.Module):
     out = self.projector(pooled)
 
     if self.use_app_recon_fusion and x_app is not None:
+      w = torch.sigmoid(self.app_recon_alpha)
       out_norm = F.normalize(out, p=2, dim=-1)
-      app_pooled = F.normalize(
-          self.app_recon_proj(global_mean_pool(x_app, batch)), p=2, dim=-1
-      )
-      out = F.normalize(
-          out_norm + torch.tanh(self.app_recon_alpha) * app_pooled, p=2, dim=-1
+      app_pooled = F.normalize(global_mean_pool(x_app, batch), p=2, dim=-1)
+      out = torch.cat(
+          [torch.sqrt(1.0 - w) * out_norm, torch.sqrt(w) * app_pooled], dim=-1
       )
 
     return out
@@ -575,11 +582,18 @@ class GraphEncoder(nn.Module):
     h2_final = torch.cat(layer_outputs2, dim=-1) if self.use_jk else h2
 
     if self.use_reconstruction_dist:
+      if self.recon_node_scope == "all":
+        recon_mask1 = torch.ones_like(mask1, dtype=torch.bool)
+        recon_mask2 = torch.ones_like(mask2, dtype=torch.bool)
+      else:
+        recon_mask1 = mask1
+        recon_mask2 = mask2
+
       dist = compute_cross_transformer_reconstruction_distance(
           h1_final=h1_final,
           h2_final=h2_final,
-          mask1=mask1,
-          mask2=mask2,
+          mask1=recon_mask1,
+          mask2=recon_mask2,
           batch1=batch1,
           batch2=batch2,
           N_query=N_query,
@@ -588,9 +602,6 @@ class GraphEncoder(nn.Module):
           scale=self.scale,
           x1_app=x1_app if self.use_app_recon_fusion else None,
           x2_app=x2_app if self.use_app_recon_fusion else None,
-          app_recon_proj=(
-              self.app_recon_proj if self.use_app_recon_fusion else None
-          ),
           app_recon_alpha=(
               self.app_recon_alpha if self.use_app_recon_fusion else None
           ),
@@ -602,14 +613,13 @@ class GraphEncoder(nn.Module):
       z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
       z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
       if self.use_app_recon_fusion and x1_app is not None and x2_app is not None:
-        app1 = F.normalize(
-            self.app_recon_proj(global_mean_pool(x1_app, batch1)), p=2, dim=-1
+        w = torch.sigmoid(self.app_recon_alpha)
+        app1 = F.normalize(global_mean_pool(x1_app, batch1), p=2, dim=-1)
+        app2 = F.normalize(global_mean_pool(x2_app, batch2), p=2, dim=-1)
+        z1_norm = torch.cat( [torch.sqrt(1.0 - w) * z1_norm, torch.sqrt(w) * app1], dim=-1
         )
-        app2 = F.normalize(
-            self.app_recon_proj(global_mean_pool(x2_app, batch2)), p=2, dim=-1
+        z2_norm = torch.cat(
+            [torch.sqrt(1.0 - w) * z2_norm, torch.sqrt(w) * app2], dim=-1
         )
-        gate = torch.tanh(self.app_recon_alpha)
-        z1_norm = F.normalize(z1_norm + gate * app1, p=2, dim=-1)
-        z2_norm = F.normalize(z2_norm + gate * app2, p=2, dim=-1)
       dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
       return dist, z1_norm, z2_norm
