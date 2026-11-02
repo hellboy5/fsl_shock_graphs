@@ -15,7 +15,7 @@ task:
   n_shot: 1
   n_query: 15
   train_episodes: 2000
-  val_episodes: 200
+  val_episodes: 300
   test_episodes: 10000
 
 # Model Architecture Configuration (Gold Baseline: 4L Uncoarsened GINE + Mean + Set Recon)
@@ -49,7 +49,7 @@ model:
 
   # --- Multimodal Appearance Fusion Toggles ---
   app_node_scope: "all"           # "all" (all graph nodes) | "seeds_only" (only deg==1 or deg>=3)
-  app_dropout: 0.2                # Drop appearance on 20% of graphs during training to prevent modality collapse
+  app_dropout: 0.35               # Drop appearance on 20% of graphs during training to prevent modality collapse
   use_app_node_input: true        # Option 1: Add zero-init appearance residual to initial node features
   use_app_edges: false            # Option 2: Add zero-init edge appearance contrast |a_u - a_v| to edges
   use_app_film: false             # Option 3: Per-layer FiLM modulation (1 + gamma) * h + beta
@@ -62,8 +62,8 @@ training:
   batch_size: 128               # Used in Stage 1 'pretrain'
   lr: 0.001                     # Stage 1 pre-training learning rate
   backbone_lr: 0.0001           # Stage 2 GMN GINE backbone learning rate (1e-4)
-  matching_lr: 0.001            # Stage 2 GMN matching head learning rate (1e-3)
-  weight_decay: 0.0001          # AdamW weight decay
+  matching_lr: 0.0001           # Stage 2 GMN matching head learning rate (1e-3)
+  weight_decay: 0.001           # AdamW weight decay
   label_smoothing: 0.0          # Used in Stage 1 'pretrain'
   use_hard_mining: false        # Enable Batch-Hard Triplet Margin in GMNEpisodicLoss
   triplet_margin: 0.2
