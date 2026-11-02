@@ -39,7 +39,7 @@ def compute_pairwise_seed_residuals(
     A_q_norm = F.normalize(A_q, p=2, dim=-1)
     A_s_norm = F.normalize(A_s, p=2, dim=-1)
     app_cos_sim = torch.einsum("qid, sjd -> qsij", A_q_norm, A_s_norm)
-    w_app = torch.sigmoid(app_match_logit)
+    w_app = 0.5 * torch.sigmoid(app_match_logit)
     cos_sim = (1.0 - w_app) * cos_sim + w_app * app_cos_sim
 
   scores = cos_sim * 5.0
@@ -91,6 +91,7 @@ def compute_cross_transformer_reconstruction_distance(
     x1_app=None,
     x2_app=None,
     app_recon_proj=None,
+    app_recon_alpha=None,
 ):
   """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
   h1_seeds = h1_final[mask1]
@@ -107,6 +108,7 @@ def compute_cross_transformer_reconstruction_distance(
   # Option 5: Late Set-Reconstruction Keypoint Residual Fusion
   if (
       app_recon_proj is not None
+      and app_recon_alpha is not None
       and x1_app is not None
       and x2_app is not None
   ):
@@ -114,8 +116,18 @@ def compute_cross_transformer_reconstruction_distance(
     x2_app_seeds = x2_app[mask2]
     all_app_seeds = torch.cat([x1_app_seeds, x2_app_seeds], dim=0)
     proj_app_seeds = app_recon_proj(all_app_seeds)
-    h1_seeds = h1_seeds + proj_app_seeds[: h1_seeds.size(0)]
-    h2_seeds = h2_seeds + proj_app_seeds[h1_seeds.size(0) :]
+
+    h1_seeds = F.normalize(h1_seeds, p=2, dim=-1)
+    h2_seeds = F.normalize(h2_seeds, p=2, dim=-1)
+    app1 = F.normalize(proj_app_seeds[: h1_seeds.size(0)], p=2, dim=-1)
+    app2 = F.normalize(proj_app_seeds[h1_seeds.size(0) :], p=2, dim=-1)
+    gate = torch.tanh(app_recon_alpha)
+
+    active1 = (x1_app_seeds.abs().sum(dim=-1, keepdim=True) > 0).type_as(app1)
+    active2 = (x2_app_seeds.abs().sum(dim=-1, keepdim=True) > 0).type_as(app2)
+
+    h1_seeds = h1_seeds + gate * app1 * active1
+    h2_seeds = h2_seeds + gate * app2 * active2
 
   H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
@@ -168,6 +180,7 @@ class GraphEncoder(nn.Module):
       use_reconstruction_dist=True,
       app_feat_dim=0,
       app_node_scope="all",
+      app_dropout=0.2,
       use_app_node_input=True,
       use_app_edges=False,
       use_app_film=False,
@@ -187,6 +200,7 @@ class GraphEncoder(nn.Module):
 
     self.app_feat_dim = int(app_feat_dim)
     self.app_node_scope = str(app_node_scope).lower()
+    self.app_dropout = float(app_dropout)
     self.use_app_node_input = bool(use_app_node_input) and self.app_feat_dim > 0
     self.use_app_edges = bool(use_app_edges) and self.app_feat_dim > 0
     self.use_app_film = bool(use_app_film) and self.app_feat_dim > 0
@@ -294,19 +308,21 @@ class GraphEncoder(nn.Module):
       )
 
     if self.use_app_node_input:
-      self.app_node_gate = nn.Linear(hidden_dim, hidden_dim)
-      nn.init.zeros_(self.app_node_gate.weight)
-      nn.init.zeros_(self.app_node_gate.bias)
+      self.app_node_gate = nn.Sequential(
+          nn.Linear(hidden_dim, hidden_dim, bias=False),
+          nn.LayerNorm(hidden_dim, elementwise_affine=False),
+      )
+      self.app_node_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
 
     if self.use_app_edges:
       self.app_edge_mlp = nn.Sequential(
           nn.Linear(hidden_dim * 2, hidden_dim),
           nn.LayerNorm(hidden_dim),
           nn.GELU(),
-          nn.Linear(hidden_dim, hidden_dim),
+          nn.Linear(hidden_dim, hidden_dim, bias=False),
+          nn.LayerNorm(hidden_dim, elementwise_affine=False),
       )
-      nn.init.zeros_(self.app_edge_mlp[-1].weight)
-      nn.init.zeros_(self.app_edge_mlp[-1].bias)
+      self.app_edge_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
 
     if self.use_app_film:
       self.app_film_layers = nn.ModuleList(
@@ -322,20 +338,17 @@ class GraphEncoder(nn.Module):
     if self.use_app_recon_fusion:
       self.app_recon_proj = nn.Sequential(
           nn.LayerNorm(self.app_feat_dim),
-          nn.Linear(self.app_feat_dim, proj_feat_dim),
-          nn.GELU(),
           nn.Dropout(dropout),
-          nn.Linear(proj_feat_dim, proj_feat_dim),
+          nn.Linear(self.app_feat_dim, proj_feat_dim, bias=False),
       )
-      nn.init.zeros_(self.app_recon_proj[-1].weight)
-      nn.init.zeros_(self.app_recon_proj[-1].bias)
+      self.app_recon_alpha = nn.Parameter(torch.zeros(1, proj_feat_dim))
 
   def _apply_pooling(self, x_final, batch):
     if self.pooling_method == "global_attention":
       return self.pool_op(x_final, batch)
     return global_mean_pool(x_final, batch)
 
-  def _encode_appearance(self, data, deg=None):
+  def _encode_appearance(self, data, deg=None, batch=None):
     if (
         self.app_feat_dim <= 0
         or not hasattr(data, "x_app")
@@ -344,6 +357,16 @@ class GraphEncoder(nn.Module):
       return None, None
 
     x_app = data.x_app
+
+    if self.training and self.app_dropout > 0.0 and batch is not None:
+      num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
+      if num_graphs > 0:
+        keep_prob = 1.0 - self.app_dropout
+        graph_keep = (
+            torch.rand(num_graphs, 1, device=x_app.device) < keep_prob
+        ).type_as(x_app)
+        x_app = x_app * graph_keep[batch]
+
     a = self.app_input_mlp(x_app) if hasattr(self, "app_input_mlp") else None
 
     if self.app_node_scope == "seeds_only":
@@ -360,7 +383,9 @@ class GraphEncoder(nn.Module):
     src, dst = edge_index[0], edge_index[1]
     a_mean = 0.5 * (a[src] + a[dst])
     a_diff = torch.abs(a[src] - a[dst])
-    return self.app_edge_mlp(torch.cat([a_mean, a_diff], dim=-1))
+    return torch.tanh(self.app_edge_alpha) * self.app_edge_mlp(
+        torch.cat([a_mean, a_diff], dim=-1)
+    )
 
   def forward(self, data):
     x, edge_index, edge_attr, batch = (
@@ -371,13 +396,13 @@ class GraphEncoder(nn.Module):
     )
 
     deg = degree(edge_index[0], num_nodes=x.size(0))
-    a, x_app = self._encode_appearance(data, deg=deg)
+    a, x_app = self._encode_appearance(data, deg=deg, batch=batch)
 
     x = self.node_encoder(x)
     edge_attr = self.edge_encoder(edge_attr)
 
     if self.use_app_node_input and a is not None:
-      x = x + self.app_node_gate(a)
+      x = x + torch.tanh(self.app_node_alpha) * self.app_node_gate(a)
     if self.use_app_edges and a is not None:
       edge_attr = edge_attr + self._compute_edge_appearance(a, edge_index)
 
@@ -391,8 +416,8 @@ class GraphEncoder(nn.Module):
           else self.norms[i](x)
       )
       if self.use_app_film and a is not None:
-        gamma, beta = self.app_film_layers[i](a).chunk(2, dim=-1)
-        x = (1.0 + gamma) * x + beta
+        raw_gamma, raw_beta = self.app_film_layers[i](a).chunk(2, dim=-1)
+        x = (1.0 + 0.5 * torch.tanh(raw_gamma)) * x + 0.5 * torch.tanh(raw_beta)
       x = F.relu(x)
       x = x + x_in
 
@@ -404,7 +429,13 @@ class GraphEncoder(nn.Module):
     out = self.projector(pooled)
 
     if self.use_app_recon_fusion and x_app is not None:
-      out = out + self.app_recon_proj(global_mean_pool(x_app, batch))
+      out_norm = F.normalize(out, p=2, dim=-1)
+      app_pooled = F.normalize(
+          self.app_recon_proj(global_mean_pool(x_app, batch)), p=2, dim=-1
+      )
+      out = F.normalize(
+          out_norm + torch.tanh(self.app_recon_alpha) * app_pooled, p=2, dim=-1
+      )
 
     return out
 
@@ -449,12 +480,13 @@ class GraphEncoder(nn.Module):
     if not mask2.any():
       mask2 = torch.ones_like(mask2)
 
-    a1, x1_app = self._encode_appearance(g1, deg=deg1)
-    a2, x2_app = self._encode_appearance(g2, deg=deg2)
+    a1, x1_app = self._encode_appearance(g1, deg=deg1, batch=batch1)
+    a2, x2_app = self._encode_appearance(g2, deg=deg2, batch=batch2)
 
     if self.use_app_node_input and a1 is not None and a2 is not None:
-      h1 = h1 + self.app_node_gate(a1)
-      h2 = h2 + self.app_node_gate(a2)
+      gate_node = torch.tanh(self.app_node_alpha)
+      h1 = h1 + gate_node * self.app_node_gate(a1)
+      h2 = h2 + gate_node * self.app_node_gate(a2)
 
     if self.use_app_edges and a1 is not None and a2 is not None:
       e1 = e1 + self._compute_edge_appearance(a1, edge_index1)
@@ -499,10 +531,10 @@ class GraphEncoder(nn.Module):
       )
 
       if self.use_app_film and a1 is not None and a2 is not None:
-        gamma1, beta1 = self.app_film_layers[i](a1).chunk(2, dim=-1)
-        gamma2, beta2 = self.app_film_layers[i](a2).chunk(2, dim=-1)
-        h1 = (1.0 + gamma1) * h1 + beta1
-        h2 = (1.0 + gamma2) * h2 + beta2
+        raw_g1, raw_b1 = self.app_film_layers[i](a1).chunk(2, dim=-1)
+        raw_g2, raw_b2 = self.app_film_layers[i](a2).chunk(2, dim=-1)
+        h1 = (1.0 + 0.5 * torch.tanh(raw_g1)) * h1 + 0.5 * torch.tanh(raw_b1)
+        h2 = (1.0 + 0.5 * torch.tanh(raw_g2)) * h2 + 0.5 * torch.tanh(raw_b2)
 
       h1 = F.relu(h1) + h1_in
       h2 = F.relu(h2) + h2_in
@@ -559,17 +591,25 @@ class GraphEncoder(nn.Module):
           app_recon_proj=(
               self.app_recon_proj if self.use_app_recon_fusion else None
           ),
+          app_recon_alpha=(
+              self.app_recon_alpha if self.use_app_recon_fusion else None
+          ),
       )
       return dist, None, None
     else:
       pooled1 = self._apply_pooling(h1_final, batch1)
       pooled2 = self._apply_pooling(h2_final, batch2)
-      z1 = self.projector(pooled1)
-      z2 = self.projector(pooled2)
+      z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
+      z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
       if self.use_app_recon_fusion and x1_app is not None and x2_app is not None:
-        z1 = z1 + self.app_recon_proj(global_mean_pool(x1_app, batch1))
-        z2 = z2 + self.app_recon_proj(global_mean_pool(x2_app, batch2))
-      z1_norm = F.normalize(z1, p=2, dim=-1)
-      z2_norm = F.normalize(z2, p=2, dim=-1)
+        app1 = F.normalize(
+            self.app_recon_proj(global_mean_pool(x1_app, batch1)), p=2, dim=-1
+        )
+        app2 = F.normalize(
+            self.app_recon_proj(global_mean_pool(x2_app, batch2)), p=2, dim=-1
+        )
+        gate = torch.tanh(self.app_recon_alpha)
+        z1_norm = F.normalize(z1_norm + gate * app1, p=2, dim=-1)
+        z2_norm = F.normalize(z2_norm + gate * app2, p=2, dim=-1)
       dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
       return dist, z1_norm, z2_norm

@@ -70,6 +70,7 @@ class MultimodalFewShotNetwork(nn.Module):
           ),
           app_feat_dim=app_feat_dim,
           app_node_scope=getattr(cfg.model, 'app_node_scope', 'all'),
+          app_dropout=getattr(cfg.model, 'app_dropout', 0.2),
           use_app_node_input=getattr(cfg.model, 'use_app_node_input', True),
           use_app_edges=getattr(cfg.model, 'use_app_edges', False),
           use_app_film=getattr(cfg.model, 'use_app_film', False),
@@ -84,6 +85,7 @@ class MultimodalFewShotNetwork(nn.Module):
       if getattr(cfg.model, 'freeze_graph', False):
         for p in self.graph_encoder.parameters():
           p.requires_grad = False
+        self.graph_encoder.eval()
         print('--> [MultimodalNetwork] Graph encoder frozen.')
 
     # --- 3. Few-Shot Metric Head ---
