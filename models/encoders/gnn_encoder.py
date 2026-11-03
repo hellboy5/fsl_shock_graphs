@@ -119,6 +119,8 @@ def _recon_chunk_step(
     app_cos_sim=None,
     pair_active=None,
     w_recon=None,
+    W_q=None,
+    W_s=None,
 ):
   """Single query-chunk set reconstruction step (compatible with gradient checkpointing)."""
   cos_sim = torch.einsum("qid, sjd -> qsij", H_q, H_s)
@@ -136,8 +138,11 @@ def _recon_chunk_step(
   )
   err_q = 2.0 - 2.0 * (A_q2s * cos_sim).sum(dim=-1)
   err_q = err_q.masked_fill(~M_q.unsqueeze(1), 0.0)
-  K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
-  dist_q2s = err_q.sum(dim=-1) / K_q_counts
+  if W_q is not None:
+    dist_q2s = (err_q * W_q).sum(dim=-1)
+  else:
+    K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    dist_q2s = err_q.sum(dim=-1) / K_q_counts
 
   # Direction 2: Support -> Query
   A_s2q = torch.nan_to_num(
@@ -146,7 +151,10 @@ def _recon_chunk_step(
   )
   err_s = 2.0 - 2.0 * (A_s2q * cos_sim).sum(dim=-2)
   err_s = err_s.masked_fill(~M_s.unsqueeze(0), 0.0)
-  dist_s2q = err_s.sum(dim=-1) / K_s_counts
+  if W_s is not None:
+    dist_s2q = (err_s * W_s).sum(dim=-1)
+  else:
+    dist_s2q = err_s.sum(dim=-1) / K_s_counts
 
   return 0.5 * (dist_q2s + dist_s2q)
 
@@ -182,6 +190,13 @@ def compute_cross_transformer_reconstruction_distance(
   H_q_all, M_q_all = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
   H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
 
+  # Global GNN Graph Anchor
+  h_q_global = F.normalize(
+      (H_q_all * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+  )
+  h_s_global = F.normalize((H_s * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1)
+  global_cos = torch.matmul(h_q_global, h_s_global.t())
+
   H_q_all = F.normalize(H_q_all, p=2, dim=-1)
   H_s = F.normalize(H_s, p=2, dim=-1)
 
@@ -192,19 +207,53 @@ def compute_cross_transformer_reconstruction_distance(
   )
   if use_late_app:
     with torch.no_grad():
-      X_q_all, _ = to_dense_batch(
+      X_q_raw, _ = to_dense_batch(
           x1_app[mask1], batch1_seeds, batch_size=N_query
       )
-      X_s_app, _ = to_dense_batch(
+      X_s_raw, _ = to_dense_batch(
           x2_app[mask2], batch2_seeds, batch_size=N_support
       )
-      q_active_all = X_q_all.abs().sum(dim=(-2, -1)) > 0
-      s_active = X_s_app.abs().sum(dim=(-2, -1)) > 0
-      X_q_all = F.normalize(X_q_all, p=2, dim=-1)
-      X_s_app = F.normalize(X_s_app, p=2, dim=-1)
-    w_recon = torch.sigmoid(app_recon_alpha)
+      q_active_all = X_q_raw.abs().sum(dim=(-2, -1)) > 0
+      s_active = X_s_raw.abs().sum(dim=(-2, -1)) > 0
+
+      # Global appearance mean vectors & intrinsic foreground node salience
+      q_mean = F.normalize(
+          (X_q_raw * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+      )
+      s_mean = F.normalize(
+          (X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+      )
+      app_global_cos = torch.matmul(q_mean, s_mean.t())
+
+      fg_wq = torch.einsum("qid, qd -> qi", X_q_raw, q_mean).clamp(min=1e-3)
+      fg_wq = fg_wq.masked_fill(~M_q_all, 0.0)
+      fg_wq = fg_wq / fg_wq.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+      unif_wq = M_q_all.float() / M_q_all.sum(dim=-1, keepdim=True).clamp(min=1.0)
+      W_q_all = torch.where(
+          q_active_all.unsqueeze(-1), 0.5 * unif_wq + 0.5 * fg_wq, unif_wq
+      ).unsqueeze(1)
+
+      fg_ws = torch.einsum("sjd, sd -> sj", X_s_raw, s_mean).clamp(min=1e-3)
+      fg_ws = fg_ws.masked_fill(~M_s, 0.0)
+      fg_ws = fg_ws / fg_ws.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+      unif_ws = M_s.float() / M_s.sum(dim=-1, keepdim=True).clamp(min=1.0)
+      W_s_all = torch.where(
+          s_active.unsqueeze(-1), 0.5 * unif_ws + 0.5 * fg_ws, unif_ws
+      ).unsqueeze(0)
+
+      X_q_all = F.normalize(X_q_raw, p=2, dim=-1)
+      X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
+      pair_2d = q_active_all.unsqueeze(1) & s_active.unsqueeze(0)
+
+    # Offset by +1.1 so alpha=0 starts at sigmoid(1.1) = 0.75 (75% App / 25% Shape)
+    w_recon = torch.sigmoid(app_recon_alpha + 1.1)
+    blended_global_cos = (1.0 - w_recon) * global_cos + w_recon * app_global_cos
+    global_cos = torch.where(pair_2d, blended_global_cos, global_cos)
   else:
     w_recon = None
+    W_s_all = None
+
+  global_dist = 2.0 - 2.0 * global_cos
 
   K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
   dist_chunks = []
@@ -226,9 +275,11 @@ def compute_cross_transformer_reconstruction_distance(
             .unsqueeze(-1)
             .unsqueeze(-1)
         )
+        W_q = W_q_all[q0:q1]
     else:
       app_cos_sim = None
       pair_active = None
+      W_q = None
 
     if use_ckpt:
       chunk_dist = checkpoint(
@@ -241,6 +292,8 @@ def compute_cross_transformer_reconstruction_distance(
           app_cos_sim,
           pair_active,
           w_recon,
+          W_q,
+          W_s_all,
           use_reentrant=False,
       )
     else:
@@ -253,11 +306,14 @@ def compute_cross_transformer_reconstruction_distance(
           app_cos_sim,
           pair_active,
           w_recon,
+          W_q,
+          W_s_all,
       )
 
     dist_chunks.append(chunk_dist)
 
-  return torch.cat(dist_chunks, dim=0)
+  local_recon_dist = torch.cat(dist_chunks, dim=0)
+  return 0.85 * local_recon_dist + 0.15 * global_dist
 
 
 class GraphEncoder(nn.Module):
@@ -526,7 +582,7 @@ class GraphEncoder(nn.Module):
     out = self.projector(pooled)
 
     if self.use_app_recon_fusion and x_app is not None:
-      w = torch.sigmoid(self.app_recon_alpha)
+      w = torch.sigmoid(self.app_recon_alpha + 1.1)
       out_norm = F.normalize(out, p=2, dim=-1)
       app_pooled = F.normalize(global_mean_pool(x_app, batch), p=2, dim=-1)
       out = torch.cat(
@@ -702,7 +758,7 @@ class GraphEncoder(nn.Module):
       z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
       z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
       if self.use_app_recon_fusion and x1_app is not None and x2_app is not None:
-        w = torch.sigmoid(self.app_recon_alpha)
+        w = torch.sigmoid(self.app_recon_alpha + 1.1)
         app1 = F.normalize(global_mean_pool(x1_app, batch1), p=2, dim=-1)
         app2 = F.normalize(global_mean_pool(x2_app, batch2), p=2, dim=-1)
         z1_norm = torch.cat(
