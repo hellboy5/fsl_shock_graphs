@@ -46,7 +46,7 @@ def compute_pairwise_seed_residuals(
       A_q_norm = F.normalize(A_q, p=2, dim=-1)
       A_s_norm = F.normalize(A_s, p=2, dim=-1)
       app_cos_sim = torch.einsum("qid, sjd -> qsij", A_q_norm, A_s_norm)
-    w_app = 0.5 * torch.sigmoid(app_match_logit)
+    w_app = 0.5 * torch.tanh(app_match_logit)
     blended_sim = (1.0 - w_app) * cos_sim + w_app * app_cos_sim
     cos_sim = torch.where(pair_act, blended_sim, cos_sim)
 
@@ -461,7 +461,6 @@ class GraphEncoder(nn.Module):
         or self.use_app_film
     )
     if needs_app_stem:
-      self.app_input_drop = nn.Dropout(0.3)
       self.app_input_mlp = nn.Sequential(
           nn.LayerNorm(self.app_feat_dim),
           nn.Linear(self.app_feat_dim, hidden_dim),
@@ -508,7 +507,7 @@ class GraphEncoder(nn.Module):
       return self.pool_op(x_final, batch)
     return global_mean_pool(x_final, batch)
 
-  def _encode_appearance(self, data, deg=None, batch=None, keep_app=None):
+  def _encode_appearance(self, data, deg=None, batch=None):
     if (
         self.app_feat_dim <= 0
         or not hasattr(data, "x_app")
@@ -518,10 +517,7 @@ class GraphEncoder(nn.Module):
 
     x_app = data.x_app
 
-    if keep_app is not None:
-      if not keep_app:
-        x_app = torch.zeros_like(x_app)
-    elif self.training and self.app_dropout > 0.0 and batch is not None:
+    if self.training and self.app_dropout > 0.0 and batch is not None:
       num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
       if num_graphs > 0:
         keep_prob = 1.0 - self.app_dropout
@@ -530,15 +526,7 @@ class GraphEncoder(nn.Module):
         ).type_as(x_app)
         x_app = x_app * graph_keep[batch]
 
-    if hasattr(self, "app_input_mlp"):
-      x_app_in = (
-          self.app_input_drop(x_app)
-          if hasattr(self, "app_input_drop")
-          else x_app
-      )
-      a = self.app_input_mlp(x_app_in)
-    else:
-      a = None
+    a = self.app_input_mlp(x_app) if hasattr(self, "app_input_mlp") else None
 
     if self.app_node_scope == "seeds_only":
       if deg is None:
@@ -650,15 +638,8 @@ class GraphEncoder(nn.Module):
     if not mask2.any():
       mask2 = torch.ones_like(mask2)
 
-    keep_app = (not self.training) or (
-        torch.rand(1, device=x1.device).item() >= self.app_dropout
-    )
-    a1, x1_app = self._encode_appearance(
-        g1, deg=deg1, batch=batch1, keep_app=keep_app
-    )
-    a2, x2_app = self._encode_appearance(
-        g2, deg=deg2, batch=batch2, keep_app=keep_app
-    )
+    a1, x1_app = self._encode_appearance(g1, deg=deg1, batch=batch1)
+    a2, x2_app = self._encode_appearance(g2, deg=deg2, batch=batch2)
 
     if self.use_app_node_input and a1 is not None and a2 is not None:
       gate_node = torch.tanh(self.app_node_alpha)
