@@ -161,11 +161,14 @@ def run_training(cfg, device):
 
     backbone_params = []
     matching_params = []
+    vision_params = []
 
     for name, param in model.named_parameters():
       if not param.requires_grad:
         continue
-      if any(
+      if "vision_encoder" in name:
+        vision_params.append(param)
+      elif any(
           k in name
           for k in ("proj_match", "node_update", "app_", "film_", "zero_")
       ):
@@ -175,13 +178,20 @@ def run_training(cfg, device):
 
     b_lr = float(getattr(cfg.training, "backbone_lr", 1e-4))
     m_lr = float(getattr(cfg.training, "matching_lr", 1e-3))
-    optimizer = optim.AdamW([
+    v_lr = float(getattr(cfg.training, "vision_lr", 1e-5))
+    param_groups = [
         {"params": backbone_params, "lr": b_lr, "weight_decay": wd},
         {"params": matching_params, "lr": m_lr, "weight_decay": wd},
-    ])
+    ]
+    if len(vision_params) > 0:
+      param_groups.append(
+          {"params": vision_params, "lr": v_lr, "weight_decay": wd}
+      )
+    optimizer = optim.AdamW(param_groups)
     print(
         "--> [Optimizer: Disentangled GMN AdamW] "
-        f"backbone_lr={b_lr}, matching_head_lr={m_lr}, "
+        f"backbone_lr={b_lr}, matching_head_lr={m_lr}, vision_lr={v_lr} "
+        f"(vision_tensors={len(vision_params)}), "
         f"weight_decay={wd} | Scheduler: CosineAnnealingLR"
     )
   else:

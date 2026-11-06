@@ -123,20 +123,74 @@ def _recon_chunk_step(
     M_q,
     M_s,
     K_s_counts,
-    app_cos_sim=None,
+    X_q=None,
+    X_s=None,
+    X_q_std=None,
+    X_s_std=None,
     pair_active=None,
     w_recon=None,
     W_q=None,
     W_s=None,
+    use_sinkhorn=False,
+    sinkhorn_iters=3,
 ):
   """Single query-chunk set reconstruction step (compatible with gradient checkpointing)."""
   cos_sim = torch.einsum("qid, sjd -> qsij", H_q, H_s)
 
-  if app_cos_sim is not None and pair_active is not None and w_recon is not None:
+  if (
+      X_q is not None
+      and X_s is not None
+      and pair_active is not None
+      and w_recon is not None
+  ):
+    app_cos_sim = torch.einsum("qid, sjd -> qsij", X_q, X_s)
+    if X_q_std is not None and X_s_std is not None:
+      std_cos_sim = torch.einsum("qid, sjd -> qsij", X_q_std, X_s_std)
+      app_cos_sim = 0.80 * app_cos_sim + 0.20 * std_cos_sim
     blended_cos = (1.0 - w_recon) * cos_sim + w_recon * app_cos_sim
     cos_sim = torch.where(pair_active, blended_cos, cos_sim)
 
   scores = cos_sim * 10.0
+
+  if use_sinkhorn:
+    # Pillar 3: Log-Domain Doubly Stochastic Sinkhorn-Knopp (Softassign)
+    valid_mask = M_q.unsqueeze(1).unsqueeze(3) & M_s.unsqueeze(0).unsqueeze(2)
+    log_P = scores.masked_fill(~valid_mask, -1e9)
+
+    if W_q is not None:
+      log_wq = W_q.clamp(min=1e-6).log().unsqueeze(-1)
+    else:
+      K_q_c = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
+      unif_q = M_q.float() / K_q_c
+      log_wq = unif_q.clamp(min=1e-6).log().unsqueeze(1).unsqueeze(-1)
+
+    if W_s is not None:
+      log_ws = W_s.clamp(min=1e-6).log().unsqueeze(-2)
+    else:
+      unif_s = M_s.float() / K_s_counts.t()
+      log_ws = unif_s.clamp(min=1e-6).log().unsqueeze(0).unsqueeze(-2)
+
+    log_P_row = log_P
+    log_P_col = log_P
+    for _ in range(int(sinkhorn_iters)):
+      log_P_row = (
+          log_P_col - torch.logsumexp(log_P_col, dim=-1, keepdim=True) + log_wq
+      )
+      log_P_row = log_P_row.masked_fill(~valid_mask, -1e9)
+      log_P_col = (
+          log_P_row - torch.logsumexp(log_P_row, dim=-2, keepdim=True) + log_ws
+      )
+      log_P_col = log_P_col.masked_fill(~valid_mask, -1e9)
+
+    Pi_q2s = (
+        torch.nan_to_num(torch.exp(log_P_row), nan=0.0) * valid_mask.float()
+    )
+    Pi_s2q = (
+        torch.nan_to_num(torch.exp(log_P_col), nan=0.0) * valid_mask.float()
+    )
+    dist_q2s = 2.0 - 2.0 * (Pi_q2s * cos_sim).sum(dim=(-2, -1))
+    dist_s2q = 2.0 - 2.0 * (Pi_s2q * cos_sim).sum(dim=(-2, -1))
+    return 0.5 * (dist_q2s + dist_s2q)
 
   # Direction 1: Query -> Support
   A_q2s = torch.nan_to_num(
@@ -179,7 +233,11 @@ def compute_cross_transformer_reconstruction_distance(
     scale=None,
     x1_app=None,
     x2_app=None,
+    x1_app_std=None,
+    x2_app_std=None,
     app_recon_alpha=None,
+    use_sinkhorn=False,
+    sinkhorn_iters=3,
     query_chunk_size=15,
 ):
   """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
@@ -213,26 +271,27 @@ def compute_cross_transformer_reconstruction_distance(
       and x2_app is not None
   )
   if use_late_app:
+    X_q_raw, _ = to_dense_batch(
+        x1_app[mask1], batch1_seeds, batch_size=N_query
+    )
+    X_s_raw, _ = to_dense_batch(
+        x2_app[mask2], batch2_seeds, batch_size=N_support
+    )
+
     with torch.no_grad():
-      X_q_raw, _ = to_dense_batch(
-          x1_app[mask1], batch1_seeds, batch_size=N_query
-      )
-      X_s_raw, _ = to_dense_batch(
-          x2_app[mask2], batch2_seeds, batch_size=N_support
-      )
-      q_active_all = X_q_raw.abs().sum(dim=(-2, -1)) > 0
-      s_active = X_s_raw.abs().sum(dim=(-2, -1)) > 0
+      X_q_det = X_q_raw.detach()
+      X_s_det = X_s_raw.detach()
+      q_active_all = X_q_det.abs().sum(dim=(-2, -1)) > 0
+      s_active = X_s_det.abs().sum(dim=(-2, -1)) > 0
 
-      # Global appearance mean vectors & intrinsic foreground node salience
-      q_mean = F.normalize(
-          (X_q_raw * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+      q_mean_det = F.normalize(
+          (X_q_det * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
       )
-      s_mean = F.normalize(
-          (X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+      s_mean_det = F.normalize(
+          (X_s_det * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
       )
-      app_global_cos = torch.matmul(q_mean, s_mean.t())
 
-      fg_wq = torch.einsum("qid, qd -> qi", X_q_raw, q_mean).clamp(min=1e-3)
+      fg_wq = torch.einsum("qid, qd -> qi", X_q_det, q_mean_det).clamp(min=1e-3)
       fg_wq = fg_wq.masked_fill(~M_q_all, 0.0)
       fg_wq = fg_wq / fg_wq.sum(dim=-1, keepdim=True).clamp(min=1e-6)
       unif_wq = M_q_all.float() / M_q_all.sum(dim=-1, keepdim=True).clamp(min=1.0)
@@ -240,17 +299,38 @@ def compute_cross_transformer_reconstruction_distance(
           q_active_all.unsqueeze(-1), 0.5 * unif_wq + 0.5 * fg_wq, unif_wq
       ).unsqueeze(1)
 
-      fg_ws = torch.einsum("sjd, sd -> sj", X_s_raw, s_mean).clamp(min=1e-3)
+      fg_ws = torch.einsum("sjd, sd -> sj", X_s_det, s_mean_det).clamp(min=1e-3)
       fg_ws = fg_ws.masked_fill(~M_s, 0.0)
       fg_ws = fg_ws / fg_ws.sum(dim=-1, keepdim=True).clamp(min=1e-6)
       unif_ws = M_s.float() / M_s.sum(dim=-1, keepdim=True).clamp(min=1.0)
       W_s_all = torch.where(
           s_active.unsqueeze(-1), 0.5 * unif_ws + 0.5 * fg_ws, unif_ws
       ).unsqueeze(0)
-
-      X_q_all = F.normalize(X_q_raw, p=2, dim=-1)
-      X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
       pair_2d = q_active_all.unsqueeze(1) & s_active.unsqueeze(0)
+
+    q_mean = F.normalize(
+        (X_q_raw * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+    )
+    s_mean = F.normalize(
+        (X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+    )
+    app_global_cos = torch.matmul(q_mean, s_mean.t())
+
+    X_q_all = F.normalize(X_q_raw, p=2, dim=-1)
+    X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
+
+    if x1_app_std is not None and x2_app_std is not None:
+      X_q_std_raw, _ = to_dense_batch(
+          x1_app_std[mask1], batch1_seeds, batch_size=N_query
+      )
+      X_s_std_raw, _ = to_dense_batch(
+          x2_app_std[mask2], batch2_seeds, batch_size=N_support
+      )
+      X_q_std_all = F.normalize(X_q_std_raw, p=2, dim=-1)
+      X_s_std_app = F.normalize(X_s_std_raw, p=2, dim=-1)
+    else:
+      X_q_std_all = None
+      X_s_std_app = None
 
     # Offset by +1.1 so alpha=0 starts at sigmoid(1.1) = 0.75 (75% App / 25% Shape)
     w_recon = torch.sigmoid(app_recon_alpha + 1.1)
@@ -259,13 +339,19 @@ def compute_cross_transformer_reconstruction_distance(
   else:
     w_recon = None
     W_s_all = None
+    X_q_all = None
+    X_s_app = None
+    X_q_std_all = None
+    X_s_std_app = None
 
   global_dist = 2.0 - 2.0 * global_cos
 
   K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
   dist_chunks = []
   use_ckpt = torch.is_grad_enabled() and (
-      H_q_all.requires_grad or H_s.requires_grad
+      H_q_all.requires_grad
+      or H_s.requires_grad
+      or (X_q_all is not None and X_q_all.requires_grad)
   )
 
   # Process queries in checkpointed chunks so 4D [chunk, N_s, L_q, L_s] tensors never OOM during backward()
@@ -275,16 +361,17 @@ def compute_cross_transformer_reconstruction_distance(
     M_q = M_q_all[q0:q1]
 
     if use_late_app:
-      with torch.no_grad():
-        app_cos_sim = torch.einsum("qid, sjd -> qsij", X_q_all[q0:q1], X_s_app)
-        pair_active = (
-            (q_active_all[q0:q1].unsqueeze(1) & s_active.unsqueeze(0))
-            .unsqueeze(-1)
-            .unsqueeze(-1)
-        )
-        W_q = W_q_all[q0:q1]
+      X_q_chunk = X_q_all[q0:q1]
+      X_q_std_chunk = X_q_std_all[q0:q1] if X_q_std_all is not None else None
+      pair_active = (
+          (q_active_all[q0:q1].unsqueeze(1) & s_active.unsqueeze(0))
+          .unsqueeze(-1)
+          .unsqueeze(-1)
+      )
+      W_q = W_q_all[q0:q1]
     else:
-      app_cos_sim = None
+      X_q_chunk = None
+      X_q_std_chunk = None
       pair_active = None
       W_q = None
 
@@ -296,11 +383,16 @@ def compute_cross_transformer_reconstruction_distance(
           M_q,
           M_s,
           K_s_counts,
-          app_cos_sim,
+          X_q_chunk,
+          X_s_app,
+          X_q_std_chunk,
+          X_s_std_app,
           pair_active,
           w_recon,
           W_q,
           W_s_all,
+          use_sinkhorn,
+          sinkhorn_iters,
           use_reentrant=False,
       )
     else:
@@ -310,11 +402,16 @@ def compute_cross_transformer_reconstruction_distance(
           M_q,
           M_s,
           K_s_counts,
-          app_cos_sim,
+          X_q_chunk,
+          X_s_app,
+          X_q_std_chunk,
+          X_s_std_app,
           pair_active,
           w_recon,
           W_q,
           W_s_all,
+          use_sinkhorn,
+          sinkhorn_iters,
       )
 
     dist_chunks.append(chunk_dist)
@@ -341,7 +438,11 @@ class GraphEncoder(nn.Module):
       use_input_mlp=True,
       use_jk=True,
       use_reconstruction_dist=True,
+      use_sinkhorn=False,
+      sinkhorn_iters=3,
       app_feat_dim=0,
+      app_mlp_dim=None,
+      hc_use_std=False,
       app_node_scope="all",
       recon_node_scope="all",
       app_dropout=0.2,
@@ -361,8 +462,14 @@ class GraphEncoder(nn.Module):
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)
     self.use_reconstruction_dist = use_reconstruction_dist
+    self.use_sinkhorn = bool(use_sinkhorn)
+    self.sinkhorn_iters = int(sinkhorn_iters)
 
     self.app_feat_dim = int(app_feat_dim)
+    self.app_mlp_dim = (
+        int(app_mlp_dim) if app_mlp_dim is not None else int(hidden_dim)
+    )
+    self.hc_use_std = bool(hc_use_std)
     self.app_node_scope = str(app_node_scope).lower()
     self.recon_node_scope = str(recon_node_scope).lower()
     self.app_dropout = float(app_dropout)
@@ -463,13 +570,22 @@ class GraphEncoder(nn.Module):
     if needs_app_stem:
       self.app_input_mlp = nn.Sequential(
           nn.LayerNorm(self.app_feat_dim),
-          nn.Linear(self.app_feat_dim, hidden_dim),
+          nn.Linear(self.app_feat_dim, self.app_mlp_dim),
           nn.GELU(),
           nn.Dropout(dropout),
-          nn.Linear(hidden_dim, hidden_dim),
+          nn.Linear(self.app_mlp_dim, hidden_dim),
           nn.LayerNorm(hidden_dim),
           nn.GELU(),
       )
+      if self.hc_use_std:
+        self.app_std_mlp = nn.Sequential(
+            nn.LayerNorm(self.app_feat_dim),
+            nn.Linear(self.app_feat_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim, elementwise_affine=False),
+        )
+        self.app_std_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
 
     if self.use_app_node_input:
       self.app_node_gate = nn.Sequential(
@@ -513,9 +629,10 @@ class GraphEncoder(nn.Module):
         or not hasattr(data, "x_app")
         or data.x_app is None
     ):
-      return None, None
+      return None, None, None
 
     x_app = data.x_app
+    x_app_std = getattr(data, "x_app_std", None)
 
     if self.training and self.app_dropout > 0.0 and batch is not None:
       num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
@@ -524,19 +641,29 @@ class GraphEncoder(nn.Module):
         graph_keep = (
             torch.rand(num_graphs, 1, device=x_app.device) < keep_prob
         ).type_as(x_app)
-        x_app = x_app * graph_keep[batch]
+        mask_g = graph_keep[batch]
+        x_app = x_app * mask_g
+        if x_app_std is not None:
+          x_app_std = x_app_std * mask_g
 
-    a = self.app_input_mlp(x_app) if hasattr(self, "app_input_mlp") else None
+    if hasattr(self, "app_input_mlp"):
+      a = self.app_input_mlp(x_app)
+      if hasattr(self, "app_std_mlp") and x_app_std is not None:
+        a = a + torch.tanh(self.app_std_alpha) * self.app_std_mlp(x_app_std)
+    else:
+      a = None
 
     if self.app_node_scope == "seeds_only":
       if deg is None:
         deg = degree(data.edge_index[0], num_nodes=data.x.size(0))
-      seed_mask = ((deg == 1) | (deg >= 3)).unsqueeze(-1)
-      x_app = x_app * seed_mask.type_as(x_app)
+      seed_mask = ((deg == 1) | (deg >= 3)).unsqueeze(-1).type_as(x_app)
+      x_app = x_app * seed_mask
+      if x_app_std is not None:
+        x_app_std = x_app_std * seed_mask
       if a is not None:
-        a = a * seed_mask.type_as(a)
+        a = a * seed_mask
 
-    return a, x_app
+    return a, x_app, x_app_std
 
   def _compute_edge_appearance(self, a, edge_index):
     src, dst = edge_index[0], edge_index[1]
@@ -555,7 +682,7 @@ class GraphEncoder(nn.Module):
     )
 
     deg = degree(edge_index[0], num_nodes=x.size(0))
-    a, x_app = self._encode_appearance(data, deg=deg, batch=batch)
+    a, x_app, _ = self._encode_appearance(data, deg=deg, batch=batch)
 
     x = self.node_encoder(x)
     edge_attr = self.edge_encoder(edge_attr)
@@ -592,7 +719,7 @@ class GraphEncoder(nn.Module):
       out_norm = F.normalize(out, p=2, dim=-1)
       app_pooled = F.normalize(global_mean_pool(x_app, batch), p=2, dim=-1)
       out = torch.cat(
-          [torch.sqrt(1.0 - w) * out_norm, torch.sqrt(w) * app_pooled], dim=-1
+ [torch.sqrt(1.0 - w) * out_norm, torch.sqrt(w) * app_pooled], dim=-1
       )
 
     return out
@@ -638,8 +765,12 @@ class GraphEncoder(nn.Module):
     if not mask2.any():
       mask2 = torch.ones_like(mask2)
 
-    a1, x1_app = self._encode_appearance(g1, deg=deg1, batch=batch1)
-    a2, x2_app = self._encode_appearance(g2, deg=deg2, batch=batch2)
+    a1, x1_app, x1_app_std = self._encode_appearance(
+        g1, deg=deg1, batch=batch1
+    )
+    a2, x2_app, x2_app_std = self._encode_appearance(
+        g2, deg=deg2, batch=batch2
+    )
 
     if self.use_app_node_input and a1 is not None and a2 is not None:
       gate_node = torch.tanh(self.app_node_alpha)
@@ -753,9 +884,13 @@ class GraphEncoder(nn.Module):
           scale=self.scale,
           x1_app=x1_app if self.use_app_recon_fusion else None,
           x2_app=x2_app if self.use_app_recon_fusion else None,
+          x1_app_std=x1_app_std if self.use_app_recon_fusion else None,
+          x2_app_std=x2_app_std if self.use_app_recon_fusion else None,
           app_recon_alpha=(
               self.app_recon_alpha if self.use_app_recon_fusion else None
           ),
+          use_sinkhorn=self.use_sinkhorn,
+          sinkhorn_iters=self.sinkhorn_iters,
       )
       return dist, None, None
     else:

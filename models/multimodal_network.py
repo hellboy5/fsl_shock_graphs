@@ -13,8 +13,8 @@ class MultimodalFewShotNetwork(nn.Module):
   """Top-level Few-Shot Network for Shock Graphs & Visual Hypercolumns.
 
   Supports:
-    - Stage 2 Graph Matching Network (fsl_method='gmn')
-    - Stage 1 / Unimodal ProtoNet evaluation (fsl_method='protonet')
+  - Stage 2 Graph Matching Network (fsl_method='gmn')
+  - Stage 1 / Unimodal ProtoNet evaluation (fsl_method='protonet')
   """
 
   def __init__(self, cfg):
@@ -25,20 +25,37 @@ class MultimodalFewShotNetwork(nn.Module):
 
     # --- 1. Vision Pathway (Used for vision baseline or frozen RFS/DeepEMD hypercolumns) ---
     self.freeze_vision = bool(getattr(cfg.model, 'freeze_vision', False))
+    self.unfreeze_vision_layer4 = bool(
+        getattr(cfg.model, 'unfreeze_vision_layer4', False)
+    )
+    self.hc_use_std = bool(getattr(cfg.model, 'hc_use_std', False))
     if self.modality in ['vision', 'multimodal']:
       self.vision_encoder = VisionEncoder(
           drop_rate=getattr(cfg.model, 'dropout', 0.1),
           hc_layers=getattr(cfg.model, 'hc_layers', [1, 2, 3]),
           hc_radius_mode=getattr(cfg.model, 'hc_radius_mode', 'disk_5pt'),
-          hc_disk_scale=float(getattr(cfg.model, 'hc_disk_scale', 0.7)),
           hc_stage_l2norm=bool(getattr(cfg.model, 'hc_stage_l2norm', True)),
+          hc_use_std=self.hc_use_std,
       )
       v_ckpt = getattr(cfg.model, 'vision_checkpoint', None)
       if v_ckpt:
         self.load_checkpoint(
             self.vision_encoder.cnn, v_ckpt, 'vision_encoder.cnn'
         )
-      if self.freeze_vision:
+      if self.unfreeze_vision_layer4:
+        self.vision_encoder.eval()
+        for p in self.vision_encoder.parameters():
+          p.requires_grad = False
+        unfrozen_cnt = 0
+        for _, m in self.vision_encoder.cnn.layer4.named_modules():
+          if isinstance(m, nn.Conv2d):
+            for p in m.parameters():
+              p.requires_grad = True
+              unfrozen_cnt += 1
+        print(
+            f'--> [MultimodalNetwork] Vision layer1-3 & BN frozen; unfroze {unfrozen_cnt} Conv2d tensors in layer4.'
+        )
+      elif self.freeze_vision:
         self.vision_encoder.eval()
         for p in self.vision_encoder.parameters():
           p.requires_grad = False
@@ -68,7 +85,11 @@ class MultimodalFewShotNetwork(nn.Module):
           use_reconstruction_dist=getattr(
               cfg.model, 'use_reconstruction_dist', True
           ),
+          use_sinkhorn=getattr(cfg.model, 'use_sinkhorn', False),
+          sinkhorn_iters=getattr(cfg.model, 'sinkhorn_iters', 3),
           app_feat_dim=app_feat_dim,
+          app_mlp_dim=getattr(cfg.model, 'app_mlp_dim', g_hidden_dim),
+          hc_use_std=self.hc_use_std,
           app_node_scope=getattr(cfg.model, 'app_node_scope', 'all'),
           recon_node_scope=getattr(cfg.model, 'recon_node_scope', 'all'),
           app_dropout=getattr(cfg.model, 'app_dropout', 0.2),
@@ -111,7 +132,9 @@ class MultimodalFewShotNetwork(nn.Module):
   def train(self, mode: bool = True):
     """Keeps frozen vision encoder BatchNorm and DropBlock in eval mode during training."""
     super().train(mode)
-    if self.modality in ['vision', 'multimodal'] and self.freeze_vision:
+    if self.modality in ['vision', 'multimodal'] and (
+        self.freeze_vision or self.unfreeze_vision_layer4
+    ):
       self.vision_encoder.eval()
     return self
 
@@ -192,17 +215,41 @@ class MultimodalFewShotNetwork(nn.Module):
     )
 
   def attach_node_hypercolumns(self, vision_batch, graph_batch):
-    """Samples (x, y, r) hypercolumns from vision_batch onto graph_batch.x_app."""
-    with torch.set_grad_enabled(not self.freeze_vision):
-      x_app = self.vision_encoder.extract_hypercolumns(
-          vision_batch, graph_batch.pos_xyr, graph_batch.batch
-      )
+    """Samples (x, y, r) hypercolumns (and optional disk std) from vision_batch onto graph_batch."""
+    need_grad = (not self.freeze_vision) or self.unfreeze_vision_layer4
+    with torch.set_grad_enabled(need_grad and self.training):
+      if self.hc_use_std:
+        x_app, x_app_std = self.vision_encoder.extract_hypercolumns(
+            vision_batch,
+            graph_batch.pos_xyr,
+            graph_batch.batch,
+            return_std=True,
+        )
+      else:
+        x_app = self.vision_encoder.extract_hypercolumns(
+            vision_batch,
+            graph_batch.pos_xyr,
+            graph_batch.batch,
+            return_std=False,
+        )
+        x_app_std = None
+
     graph_batch.x_app = x_app
     if hasattr(graph_batch, '_slice_dict') and 'x' in graph_batch._slice_dict:
       graph_batch._slice_dict['x_app'] = graph_batch._slice_dict['x'].clone()
       graph_batch._inc_dict['x_app'] = torch.zeros_like(
           graph_batch._inc_dict['x']
       )
+
+    if x_app_std is not None:
+      graph_batch.x_app_std = x_app_std
+      if hasattr(graph_batch, '_slice_dict') and 'x' in graph_batch._slice_dict:
+        graph_batch._slice_dict['x_app_std'] = (
+            graph_batch._slice_dict['x'].clone()
+        )
+        graph_batch._inc_dict['x_app_std'] = torch.zeros_like(
+            graph_batch._inc_dict['x']
+        )
     return graph_batch
 
   def extract_fused_features(self, vision_batch, graph_batch):
