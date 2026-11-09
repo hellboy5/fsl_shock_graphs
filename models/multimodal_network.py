@@ -22,6 +22,7 @@ class MultimodalFewShotNetwork(nn.Module):
     self.cfg = cfg
     self.modality = cfg.model.modality
     self.fsl_method = cfg.model.fsl_method
+    self.last_gnn_logits = None
 
     # --- 1. Vision Pathway (Used for vision baseline or frozen RFS/DeepEMD hypercolumns) ---
     self.freeze_vision = bool(getattr(cfg.model, 'freeze_vision', False))
@@ -87,6 +88,9 @@ class MultimodalFewShotNetwork(nn.Module):
           ),
           use_sinkhorn=getattr(cfg.model, 'use_sinkhorn', False),
           sinkhorn_iters=getattr(cfg.model, 'sinkhorn_iters', 3),
+          use_direct_app=getattr(cfg.model, 'use_direct_app', False),
+          use_full_app_prop=getattr(cfg.model, 'use_full_app_prop', False),
+          use_center_norm=getattr(cfg.model, 'use_center_norm', False),
           app_feat_dim=app_feat_dim,
           app_mlp_dim=getattr(cfg.model, 'app_mlp_dim', g_hidden_dim),
           hc_use_std=self.hc_use_std,
@@ -274,15 +278,24 @@ class MultimodalFewShotNetwork(nn.Module):
       batch_q = Batch.from_data_list(graph_list[num_support:]).to(device)
 
       dist_matrix, _, _ = self.graph_encoder.forward_gmn(batch_q, batch_s)
+      gnn_dist = getattr(self.graph_encoder, 'last_gnn_dist', None)
 
       if k_shot > 1:
         dist_matrix = dist_matrix.view(
             dist_matrix.size(0), n_way, k_shot
         ).mean(dim=-1)
+        if gnn_dist is not None:
+          gnn_dist = gnn_dist.view(
+              gnn_dist.size(0), n_way, k_shot
+          ).mean(dim=-1)
 
+      self.last_gnn_logits = (
+          (-self.scale * gnn_dist) if gnn_dist is not None else None
+      )
       return -self.scale * dist_matrix
 
     # --- Standard ProtoNet / Matching Siamese Branch ---
+    self.last_gnn_logits = None
     features = self.extract_fused_features(vision_batch, graph_batch)
     k_total = n_way * k_shot
     support_features = features[:k_total]

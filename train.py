@@ -81,6 +81,20 @@ def run_training(cfg, device):
       cfg.task.val_episodes,
   )
 
+  # Pre-generate fixed integer index batches for validation (~0.38 MB RAM for 600 episodes)
+  # Guarantees every epoch is evaluated on the exact same validation episodes!
+  rng_state_np = np.random.get_state()
+  rng_state_py = random.getstate()
+  np.random.seed(cfg.seed + 10000)
+  random.seed(cfg.seed + 10000)
+  fixed_val_episodes = list(val_sampler)
+  np.random.set_state(rng_state_np)
+  random.setstate(rng_state_py)
+  print(
+      f'--> [Validation] Locked {len(fixed_val_episodes)} fixed validation'
+      ' episodes (indices only) across all epochs.'
+  )
+
   num_workers = int(getattr(cfg.training, 'num_workers', 4))
   g = torch.Generator()
   g.manual_seed(cfg.seed)
@@ -98,7 +112,7 @@ def run_training(cfg, device):
   )
   val_loader = DataLoader(
       val_set,
-      batch_sampler=val_sampler,
+      batch_sampler=fixed_val_episodes,
       collate_fn=collate_fn,
       num_workers=num_workers,
       pin_memory=True,
@@ -121,7 +135,7 @@ def run_training(cfg, device):
 
     # Discard 64-class classification projection head from Stage 1 pre-training
     state_dict = {
-        k: v for k, v in state_dict.items() if not k.startswith("classifier")
+        k: v for k, v in state_dict.items() if not k.startswith('classifier')
     }
 
     model_dict = model.state_dict()
@@ -149,12 +163,12 @@ def run_training(cfg, device):
     )
 
   # --- Optimizer Routing (AdamW) ---
-  wd = float(getattr(cfg.training, "weight_decay", 0.0001))
+  wd = float(getattr(cfg.training, 'weight_decay', 0.0001))
 
-  if has_loaded_checkpoint and cfg.model.fsl_method == "gmn":
+  if has_loaded_checkpoint and cfg.model.fsl_method == 'gmn':
     # Re-zero final layer of node_update in case Stage 1 checkpoint saved random init weights
-    if hasattr(model, "graph_encoder") and hasattr(
-        model.graph_encoder, "node_update"
+    if hasattr(model, 'graph_encoder') and hasattr(
+        model.graph_encoder, 'node_update'
     ):
       torch.nn.init.zeros_(model.graph_encoder.node_update[-1].weight)
       torch.nn.init.zeros_(model.graph_encoder.node_update[-1].bias)
@@ -166,33 +180,33 @@ def run_training(cfg, device):
     for name, param in model.named_parameters():
       if not param.requires_grad:
         continue
-      if "vision_encoder" in name:
+      if 'vision_encoder' in name:
         vision_params.append(param)
       elif any(
           k in name
-          for k in ("proj_match", "node_update", "app_", "film_", "zero_")
+          for k in ('proj_match', 'node_update', 'app_', 'film_', 'zero_')
       ):
         matching_params.append(param)
       else:
         backbone_params.append(param)
 
-    b_lr = float(getattr(cfg.training, "backbone_lr", 1e-4))
-    m_lr = float(getattr(cfg.training, "matching_lr", 1e-3))
-    v_lr = float(getattr(cfg.training, "vision_lr", 1e-5))
+    b_lr = float(getattr(cfg.training, 'backbone_lr', 1e-4))
+    m_lr = float(getattr(cfg.training, 'matching_lr', 1e-3))
+    v_lr = float(getattr(cfg.training, 'vision_lr', 1e-5))
     param_groups = [
-        {"params": backbone_params, "lr": b_lr, "weight_decay": wd},
-        {"params": matching_params, "lr": m_lr, "weight_decay": wd},
+        {'params': backbone_params, 'lr': b_lr, 'weight_decay': wd},
+        {'params': matching_params, 'lr': m_lr, 'weight_decay': wd},
     ]
     if len(vision_params) > 0:
       param_groups.append(
-          {"params": vision_params, "lr": v_lr, "weight_decay": wd}
+          {'params': vision_params, 'lr': v_lr, 'weight_decay': wd}
       )
     optimizer = optim.AdamW(param_groups)
     print(
-        "--> [Optimizer: Disentangled GMN AdamW] "
-        f"backbone_lr={b_lr}, matching_head_lr={m_lr}, vision_lr={v_lr} "
-        f"(vision_tensors={len(vision_params)}), "
-        f"weight_decay={wd} | Scheduler: CosineAnnealingLR"
+        '--> [Optimizer: Disentangled GMN AdamW] '
+        f'backbone_lr={b_lr}, matching_head_lr={m_lr}, vision_lr={v_lr} '
+        f'(vision_tensors={len(vision_params)}), '
+        f'weight_decay={wd} | Scheduler: CosineAnnealingLR'
     )
   else:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -202,8 +216,8 @@ def run_training(cfg, device):
         weight_decay=wd,
     )
     print(
-        f"--> [Optimizer: AdamW] lr={cfg.training.lr}, "
-        f"weight_decay={wd} | Scheduler: CosineAnnealingLR"
+        f'--> [Optimizer: AdamW] lr={cfg.training.lr}, '
+        f'weight_decay={wd} | Scheduler: CosineAnnealingLR'
     )
 
   scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -218,6 +232,7 @@ def run_training(cfg, device):
   )
   best_val_acc = 0.0
   scale = float(getattr(cfg.model, 'scale', 5.0))
+  co_train_alpha = float(getattr(cfg.training, 'co_train_alpha', 0.0))
 
   criterion = GMNEpisodicLoss(
       tau=1.0 / scale,
@@ -228,7 +243,7 @@ def run_training(cfg, device):
 
   print(
       f'--- Starting Training: {cfg.model.modality} modality | Seed: {cfg.seed}'
-      f' | Workers: {num_workers} ---'
+      f' | Co-Train Alpha: {co_train_alpha} | Workers: {num_workers} ---'
   )
 
   for epoch in range(1, cfg.training.epochs + 1):
@@ -250,6 +265,13 @@ def run_training(cfg, device):
 
       logits = model(img_batch, graph_batch, n_way, n_shot)
       loss = criterion(logits, targets, is_distance=False)
+
+      # Dual-Loss Co-Training: Direct auxiliary supervision on the GNN branch
+      gnn_logits = getattr(model, 'last_gnn_logits', None)
+      if co_train_alpha > 0.0 and gnn_logits is not None:
+        gnn_loss = criterion(gnn_logits, targets, is_distance=False)
+        loss = loss + co_train_alpha * gnn_loss
+
       loss.backward()
 
       torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -259,7 +281,7 @@ def run_training(cfg, device):
       train_accs.append(calculate_accuracy(logits, targets))
 
     model.eval()
-    val_accs = []
+    val_accs, gnn_val_accs = [], []
     with torch.no_grad():
       for batch in val_loader:
         img_batch = (
@@ -275,13 +297,20 @@ def run_training(cfg, device):
 
         logits = model(img_batch, graph_batch, n_way, n_shot)
         val_accs.append(calculate_accuracy(logits, targets))
+        if getattr(model, 'last_gnn_logits', None) is not None:
+          gnn_val_accs.append(
+              calculate_accuracy(model.last_gnn_logits, targets)
+          )
 
     mean_val_acc = float(np.mean(val_accs))
     current_lr = optimizer.param_groups[0]['lr']
+    gnn_val_str = (
+        f' | GNN Val: {np.mean(gnn_val_accs):.2f}%' if gnn_val_accs else ''
+    )
     print(
         f'Epoch {epoch:03d} | Train Loss: {np.mean(train_losses):.4f} | Train'
-        f' Acc: {np.mean(train_accs):.2f}% | Val Acc: {mean_val_acc:.2f}% | LR:'
-        f' {current_lr:.6f}',
+        f' Acc: {np.mean(train_accs):.2f}%{gnn_val_str} | Val Acc:'
+        f' {mean_val_acc:.2f}% | LR: {current_lr:.6f}',
         flush=True,
     )
 

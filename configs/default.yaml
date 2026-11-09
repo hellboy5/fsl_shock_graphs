@@ -54,7 +54,10 @@ model:
   app_mlp_dim: 128                # Pillar 2: Intermediate hidden dim of app_input_mlp (128, 256, 384)
   app_node_scope: "all"           # "all" (all graph nodes) | "seeds_only" (only deg==1 or deg>=3)
   recon_node_scope: "all"         # "all" (all nodes in final dist_recon) | "seeds_only" (only deg==1 or deg>=3)
-  app_dropout: 0.35               # Drop appearance on 20% of graphs during training to prevent modality collapse
+  app_dropout: 0.35               # Drop appearance on 35% of graphs during training to prevent modality collapse
+  use_direct_app: false           # Steps 1 & 2: Direct 9-D node salience & 10-D edge contrast (no app_input_mlp)
+  use_full_app_prop: false        # Step 3: Propagate full 1,120-D x_app across GNN hops
+  use_center_norm: false          # Step 4: DeepEMD per-node channel mean centering in dist_recon
   use_app_node_input: true        # Option 1: Add zero-init appearance residual to initial node features
   use_app_edges: false            # Option 2: Add zero-init edge appearance contrast |a_u - a_v| to edges
   use_app_film: false             # Option 3: Per-layer FiLM modulation (1 + gamma) * h + beta
@@ -69,6 +72,7 @@ training:
   backbone_lr: 0.0001           # Stage 2 GMN GINE backbone learning rate (1e-4)
   matching_lr: 0.0001           # Stage 2 GMN matching head learning rate (1e-3)
   vision_lr: 0.00001            # Pillar 1: Stage 2 ResNet-12 layer4 learning rate (1e-5)
+  co_train_alpha: 0.0           # Weight for auxiliary GNN-branch co-training loss (e.g. 0.5)
   weight_decay: 0.001           # AdamW weight decay
   label_smoothing: 0.0          # Used in Stage 1 'pretrain'
   use_hard_mining: false        # Enable Batch-Hard Triplet Margin in GMNEpisodicLoss
