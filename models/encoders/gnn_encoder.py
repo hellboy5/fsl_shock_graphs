@@ -270,6 +270,7 @@ def compute_cross_transformer_reconstruction_distance(
     use_sinkhorn=False,
     sinkhorn_iters=3,
     use_center_norm=False,
+    use_app_only_recon=False,
     return_gnn_dist=False,
     query_chunk_size=15,
 ):
@@ -374,8 +375,11 @@ def compute_cross_transformer_reconstruction_distance(
       X_q_std_all = None
       X_s_std_app = None
 
-    # Bounded in [0.50, 0.75] so GNN weight (1 - w_recon) is guaranteed in [25%, 50%]
-    w_recon = 0.50 + 0.25 * torch.sigmoid(app_recon_alpha + 1.1)
+    if use_app_only_recon:
+      # 100% 4-hop Shock-Graph-Propagated 1,120-D Appearance (Zero 128-D dilution)
+      w_recon = torch.tensor(1.0, device=H_q_all.device, dtype=H_q_all.dtype)
+    else:
+      w_recon = torch.sigmoid(app_recon_alpha + 1.1)
     blended_global_cos = (1.0 - w_recon) * gnn_global_cos + w_recon * app_global_cos
     global_cos = torch.where(pair_2d, blended_global_cos, gnn_global_cos)
   else:
@@ -490,6 +494,7 @@ class GraphEncoder(nn.Module):
       use_direct_app=False,
       use_full_app_prop=False,
       use_center_norm=False,
+      use_app_only_recon=False,
       app_feat_dim=0,
       app_mlp_dim=None,
       hc_use_std=False,
@@ -515,6 +520,7 @@ class GraphEncoder(nn.Module):
     self.use_sinkhorn = bool(use_sinkhorn)
     self.sinkhorn_iters = int(sinkhorn_iters)
     self.use_center_norm = bool(use_center_norm)
+    self.use_app_only_recon = bool(use_app_only_recon)
     self.last_gnn_dist = None
 
     self.app_feat_dim = int(app_feat_dim)
@@ -694,16 +700,22 @@ class GraphEncoder(nn.Module):
     if self.use_app_recon_fusion:
       self.app_recon_alpha = nn.Parameter(torch.tensor(0.0))
 
-    # Step 3: Per-hop scalar edge gates w_uv^(l) & step sizes beta_l for 1,120-D propagation
+    # Step 3: Nonlinear relational edge gates & active beta=0.23 init for 1,120-D propagation
     if self.use_full_app_prop:
       self.app_prop_gates = nn.ModuleList(
-          [nn.Linear(hidden_dim, 1) for _ in range(num_layers)]
+          [
+              nn.Sequential(
+                  nn.Linear(hidden_dim * 3, hidden_dim // 2),
+                  nn.LayerNorm(hidden_dim // 2),
+                  nn.GELU(),
+                  nn.Linear(hidden_dim // 2, 1),
+              )
+              for _ in range(num_layers)
+          ]
       )
-      for gate in self.app_prop_gates:
-        nn.init.zeros_(gate.weight)
-        nn.init.zeros_(gate.bias)
+      # Initialize at 0.5 -> beta = 0.5 * tanh(0.5) = 0.23 (Active from Step 0!)
       self.app_prop_betas = nn.ParameterList(
-          [nn.Parameter(torch.tensor(0.0)) for _ in range(num_layers)]
+          [nn.Parameter(torch.tensor(0.5)) for _ in range(num_layers)]
       )
 
   def _apply_pooling(self, x_final, batch):
@@ -820,7 +832,14 @@ class GraphEncoder(nn.Module):
     x_app = data.x_app
     x_app_std = getattr(data, "x_app_std", None)
 
-    if self.training and self.app_dropout > 0.0 and batch is not None:
+    # Do not zero out x_app when full 1,120-D propagation or 100% app recon is active
+    if (
+        self.training
+        and self.app_dropout > 0.0
+        and not self.use_full_app_prop
+        and not self.use_app_only_recon
+        and batch is not None
+    ):
       num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
       if num_graphs > 0:
         keep_prob = 1.0 - self.app_dropout
@@ -870,9 +889,16 @@ class GraphEncoder(nn.Module):
       x_norm = F.normalize(x_app.detach(), p=2, dim=-1)
       vis_edge_cos = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
 
+    h_norm = F.normalize(h, p=2, dim=-1)
+    struct_edge_cos = (h_norm[src] * h_norm[dst]).sum(dim=-1, keepdim=True)
+    rel_feat = torch.cat(
+        [(h[src] - h[dst]).abs(), h[src] * h[dst], e], dim=-1
+    )
+
     edge_logits = (
-        self.app_prop_gates[layer_idx](h[src] + h[dst] + e)
-        + 5.0 * vis_edge_cos
+        self.app_prop_gates[layer_idx](rel_feat)
+        + 3.0 * struct_edge_cos
+        + 3.0 * vis_edge_cos
     ).squeeze(-1)
     w_uv = softmax(edge_logits, index=dst, num_nodes=num_nodes).unsqueeze(-1)
 
@@ -939,7 +965,7 @@ class GraphEncoder(nn.Module):
     out = self.projector(pooled)
 
     if self.use_app_recon_fusion and x_app is not None:
-      w = 0.50 + 0.25 * torch.sigmoid(self.app_recon_alpha + 1.1)
+      w = torch.sigmoid(self.app_recon_alpha + 1.1)
       out_norm = F.normalize(out, p=2, dim=-1)
       app_pooled = F.normalize(global_mean_pool(x_app, batch), p=2, dim=-1)
       out = torch.cat(
@@ -1064,15 +1090,6 @@ class GraphEncoder(nn.Module):
       h1 = F.relu(h1) + h1_in
       h2 = F.relu(h2) + h2_in
 
-      # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors
-      if self.use_full_app_prop and x1_app is not None and x2_app is not None:
-        x1_app = self._propagate_full_appearance(
-            x1_app, h1, e1, edge_index1, i
-        )
-        x2_app = self._propagate_full_appearance(
-            x2_app, h2, e2, edge_index2, i
-        )
-
       h1_seeds = h1[mask1]
       h2_seeds = h2[mask2]
 
@@ -1100,6 +1117,15 @@ class GraphEncoder(nn.Module):
 
       h1 = h1 + delta1
       h2 = h2 + delta2
+
+      # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors (After GMN seed update!)
+      if self.use_full_app_prop and x1_app is not None and x2_app is not None:
+        x1_app = self._propagate_full_appearance(
+            x1_app, h1, e1, edge_index1, i
+        )
+        x2_app = self._propagate_full_appearance(
+            x2_app, h2, e2, edge_index2, i
+        )
 
       if self.use_jk:
         layer_outputs1.append(h1)
@@ -1138,6 +1164,9 @@ class GraphEncoder(nn.Module):
           use_sinkhorn=self.use_sinkhorn,
           sinkhorn_iters=self.sinkhorn_iters,
           use_center_norm=self.use_center_norm,
+          use_app_only_recon=(
+              self.use_app_only_recon or self.use_full_app_prop
+          ),
           return_gnn_dist=True,
       )
       self.last_gnn_dist = gnn_dist
@@ -1149,7 +1178,7 @@ class GraphEncoder(nn.Module):
       z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
       self.last_gnn_dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
       if self.use_app_recon_fusion and x1_app is not None and x2_app is not None:
-        w = 0.50 + 0.25 * torch.sigmoid(self.app_recon_alpha + 1.1)
+        w = torch.sigmoid(self.app_recon_alpha + 1.1)
         app1 = F.normalize(global_mean_pool(x1_app, batch1), p=2, dim=-1)
         app2 = F.normalize(global_mean_pool(x2_app, batch2), p=2, dim=-1)
         z1_norm = torch.cat(
