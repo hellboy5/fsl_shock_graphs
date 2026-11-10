@@ -46,6 +46,8 @@ model:
 
   # --- Visual Hypercolumn Extraction Settings ---
   hc_layers: [3, 4]               # ResNet-12 stages to concat: e.g. [3, 4], [2, 3, 4], [1, 2, 3, 4], [4]
+  hc_unfreeze_layers: []          # ResNet-12 stages to fine-tune in Stage 2: [] (frozen), [4], [3, 4]
+  hc_no_maxpool_layers: []        # ResNet-12 stages that skip final MaxPool2d(2): [], [4] (10x10), [3, 4] (21x21)
   hc_radius_mode: "disk_5pt"      # "none" | "concat_r" | "disk_5pt" | "disk_9pt" | "center_ring_concat"
   hc_stage_l2norm: false          # false preserves Stage-4 semantic dominance over earlier stages
   hc_use_std: false               # Pillar 4: Compute per-node standard deviation across disk sample points

@@ -29,6 +29,14 @@ class MultimodalFewShotNetwork(nn.Module):
     self.unfreeze_vision_layer4 = bool(
         getattr(cfg.model, 'unfreeze_vision_layer4', False)
     )
+    self.hc_unfreeze_layers = [
+        int(s) for s in getattr(cfg.model, 'hc_unfreeze_layers', [])
+    ]
+    if self.unfreeze_vision_layer4 and 4 not in self.hc_unfreeze_layers:
+      self.hc_unfreeze_layers.append(4)
+    self.hc_no_maxpool_layers = [
+        int(s) for s in getattr(cfg.model, 'hc_no_maxpool_layers', [])
+    ]
     self.hc_use_std = bool(getattr(cfg.model, 'hc_use_std', False))
     if self.modality in ['vision', 'multimodal']:
       self.vision_encoder = VisionEncoder(
@@ -43,18 +51,32 @@ class MultimodalFewShotNetwork(nn.Module):
         self.load_checkpoint(
             self.vision_encoder.cnn, v_ckpt, 'vision_encoder.cnn'
         )
-      if self.unfreeze_vision_layer4:
+      if len(self.hc_no_maxpool_layers) > 0:
+        self.vision_encoder.cnn.configure_high_res_stages(
+            self.hc_no_maxpool_layers
+        )
+        print(
+            f'--> [MultimodalNetwork] Skipped MaxPool2d on stages {self.hc_no_maxpool_layers}.'
+        )
+      if len(self.hc_unfreeze_layers) > 0:
         self.vision_encoder.eval()
         for p in self.vision_encoder.parameters():
           p.requires_grad = False
+        stage_blocks = {
+            1: self.vision_encoder.cnn.layer1,
+            2: self.vision_encoder.cnn.layer2,
+            3: self.vision_encoder.cnn.layer3,
+            4: self.vision_encoder.cnn.layer4,
+        }
         unfrozen_cnt = 0
-        for _, m in self.vision_encoder.cnn.layer4.named_modules():
-          if isinstance(m, nn.Conv2d):
-            for p in m.parameters():
-              p.requires_grad = True
-              unfrozen_cnt += 1
+        for s in self.hc_unfreeze_layers:
+          for _, m in stage_blocks[s].named_modules():
+            if isinstance(m, nn.Conv2d):
+              for p in m.parameters():
+                p.requires_grad = True
+                unfrozen_cnt += 1
         print(
-            f'--> [MultimodalNetwork] Vision layer1-3 & BN frozen; unfroze {unfrozen_cnt} Conv2d tensors in layer4.'
+            f'--> [MultimodalNetwork] Vision BN frozen; unfroze {unfrozen_cnt} Conv2d tensors in stages {self.hc_unfreeze_layers}.'
         )
       elif self.freeze_vision:
         self.vision_encoder.eval()
@@ -137,7 +159,9 @@ class MultimodalFewShotNetwork(nn.Module):
     """Keeps frozen vision encoder BatchNorm and DropBlock in eval mode during training."""
     super().train(mode)
     if self.modality in ['vision', 'multimodal'] and (
-        self.freeze_vision or self.unfreeze_vision_layer4
+        self.freeze_vision
+        or self.unfreeze_vision_layer4
+        or len(self.hc_unfreeze_layers) > 0
     ):
       self.vision_encoder.eval()
     return self
@@ -220,7 +244,11 @@ class MultimodalFewShotNetwork(nn.Module):
 
   def attach_node_hypercolumns(self, vision_batch, graph_batch):
     """Samples (x, y, r) hypercolumns (and optional disk std) from vision_batch onto graph_batch."""
-    need_grad = (not self.freeze_vision) or self.unfreeze_vision_layer4
+    need_grad = (
+        (not self.freeze_vision)
+        or self.unfreeze_vision_layer4
+        or (len(self.hc_unfreeze_layers) > 0)
+    )
     with torch.set_grad_enabled(need_grad and self.training):
       if self.hc_use_std:
         x_app, x_app_std = self.vision_encoder.extract_hypercolumns(

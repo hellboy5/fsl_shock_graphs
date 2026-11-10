@@ -376,7 +376,6 @@ def compute_cross_transformer_reconstruction_distance(
       X_s_std_app = None
 
     if use_app_only_recon:
-      # 100% 4-hop Shock-Graph-Propagated 1,120-D Appearance (Zero 128-D dilution)
       w_recon = torch.tensor(1.0, device=H_q_all.device, dtype=H_q_all.dtype)
     else:
       w_recon = torch.sigmoid(app_recon_alpha + 1.1)
@@ -832,14 +831,7 @@ class GraphEncoder(nn.Module):
     x_app = data.x_app
     x_app_std = getattr(data, "x_app_std", None)
 
-    # Do not zero out x_app when full 1,120-D propagation or 100% app recon is active
-    if (
-        self.training
-        and self.app_dropout > 0.0
-        and not self.use_full_app_prop
-        and not self.use_app_only_recon
-        and batch is not None
-    ):
+    if self.training and self.app_dropout > 0.0 and batch is not None:
       num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
       if num_graphs > 0:
         keep_prob = 1.0 - self.app_dropout
@@ -1164,9 +1156,7 @@ class GraphEncoder(nn.Module):
           use_sinkhorn=self.use_sinkhorn,
           sinkhorn_iters=self.sinkhorn_iters,
           use_center_norm=self.use_center_norm,
-          use_app_only_recon=(
-              self.use_app_only_recon or self.use_full_app_prop
-          ),
+          use_app_only_recon=self.use_app_only_recon,
           return_gnn_dist=True,
       )
       self.last_gnn_dist = gnn_dist
