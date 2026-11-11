@@ -513,6 +513,7 @@ class GraphEncoder(nn.Module):
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
     self.proj_feat_dim = proj_feat_dim
+    self.dropout = float(dropout)
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)
     self.use_reconstruction_dist = use_reconstruction_dist
@@ -943,6 +944,10 @@ class GraphEncoder(nn.Module):
         raw_gamma, raw_beta = self.app_film_layers[i](a).chunk(2, dim=-1)
         x = (1.0 + 0.5 * torch.tanh(raw_gamma)) * x + 0.5 * torch.tanh(raw_beta)
       x = F.relu(x)
+      
+      if i < self.num_layers - 1 and self.dropout > 0.0:
+        x = F.dropout(x, p=self.dropout, training=self.training)
+      
       x = x + x_in
       if self.use_full_app_prop and x_app is not None:
         x_app = self._propagate_full_appearance(
@@ -1079,8 +1084,13 @@ class GraphEncoder(nn.Module):
         h1 = (1.0 + 0.5 * torch.tanh(raw_g1)) * h1 + 0.5 * torch.tanh(raw_b1)
         h2 = (1.0 + 0.5 * torch.tanh(raw_g2)) * h2 + 0.5 * torch.tanh(raw_b2)
 
-      h1 = F.relu(h1) + h1_in
-      h2 = F.relu(h2) + h2_in
+      h1 = F.relu(h1)
+      h2 = F.relu(h2)
+      if i < self.num_layers - 1 and self.dropout > 0.0:
+        h1 = F.dropout(h1, p=self.dropout, training=self.training)
+        h2 = F.dropout(h2, p=self.dropout, training=self.training)
+      h1 = h1 + h1_in
+      h2 = h2 + h2_in
 
       h1_seeds = h1[mask1]
       h2_seeds = h2[mask2]
