@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from torch_geometric.nn import GINEConv, GlobalAttention, GraphNorm, global_mean_pool
 from torch_geometric.utils import degree, scatter, softmax, to_dense_batch
 
@@ -61,22 +60,126 @@ def compute_pairwise_seed_residuals(
   return mu1_seeds, mu2_seeds
 
 
-def _recon_chunk_step(
-    H_q,
-    H_s,
-    M_q,
-    M_s,
-    K_s_counts,
-    X_q=None,
-    X_s=None,
-    pair_active=None,
-    w_recon=None,
-    W_q=None,
-    W_s=None,
+def compute_cross_transformer_reconstruction_distance(
+    h1_final,
+    h2_final,
+    batch1,
+    batch2,
+    N_query,
+    N_support,
+    projector=None,
+    scale=None,
+    x1_app=None,
+    x2_app=None,
+    app_recon_alpha=None,
+    use_center_norm=False,
+    return_gnn_dist=False,
 ):
-  """Single query-chunk set reconstruction step returning stacked [mm_dist, gnn_dist]."""
+  """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
+  h1_seeds = h1_final
+  h2_seeds = h2_final
+  batch1_seeds = batch1
+  batch2_seeds = batch2
+
+  if projector is not None and h1_seeds.size(-1) == projector[0].in_features:
+    all_seeds = torch.cat([h1_seeds, h2_seeds], dim=0)
+    proj_seeds = projector(all_seeds)
+    h1_seeds = proj_seeds[: h1_seeds.size(0)]
+    h2_seeds = proj_seeds[h1_seeds.size(0) :]
+
+  H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
+  H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
+
+  # Global GNN Graph Anchor
+  h_q_global = F.normalize(
+      (H_q * M_q.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+  )
+  h_s_global = F.normalize((H_s * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1)
+  gnn_global_cos = torch.matmul(h_q_global, h_s_global.t())
+  gnn_global_dist = 2.0 - 2.0 * gnn_global_cos
+  global_cos = gnn_global_cos
+
+  H_q = F.normalize(H_q, p=2, dim=-1)
+  H_s = F.normalize(H_s, p=2, dim=-1)
+
+  use_late_app = (
+      app_recon_alpha is not None
+      and x1_app is not None
+      and x2_app is not None
+  )
+  if use_late_app:
+    X_q_raw, _ = to_dense_batch(
+        x1_app, batch1_seeds, batch_size=N_query
+    )
+    X_s_raw, _ = to_dense_batch(
+        x2_app, batch2_seeds, batch_size=N_support
+    )
+
+    with torch.no_grad():
+      X_q_det = X_q_raw.detach()
+      X_s_det = X_s_raw.detach()
+      q_active_all = X_q_det.abs().sum(dim=(-2, -1)) > 0
+      s_active = X_s_det.abs().sum(dim=(-2, -1)) > 0
+
+      q_mean_det = F.normalize(
+          (X_q_det * M_q.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+      )
+      s_mean_det = F.normalize(
+          (X_s_det * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+      )
+
+      fg_wq = torch.einsum("qid, qd -> qi", X_q_det, q_mean_det).clamp(min=1e-3)
+      fg_wq = fg_wq.masked_fill(~M_q, 0.0)
+      fg_wq = fg_wq / fg_wq.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+      unif_wq = M_q.float() / M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
+      W_q = torch.where(
+          q_active_all.unsqueeze(-1), 0.5 * unif_wq + 0.5 * fg_wq, unif_wq
+      ).unsqueeze(1)
+
+      fg_ws = torch.einsum("sjd, sd -> sj", X_s_det, s_mean_det).clamp(min=1e-3)
+      fg_ws = fg_ws.masked_fill(~M_s, 0.0)
+      fg_ws = fg_ws / fg_ws.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+      unif_ws = M_s.float() / M_s.sum(dim=-1, keepdim=True).clamp(min=1.0)
+      W_s = torch.where(
+          s_active.unsqueeze(-1), 0.5 * unif_ws + 0.5 * fg_ws, unif_ws
+      ).unsqueeze(0)
+      pair_2d = q_active_all.unsqueeze(1) & s_active.unsqueeze(0)
+      pair_active = pair_2d.unsqueeze(-1).unsqueeze(-1)
+
+    q_mean = F.normalize(
+        (X_q_raw * M_q.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+    )
+    s_mean = F.normalize(
+        (X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+    )
+    app_global_cos = torch.matmul(q_mean, s_mean.t())
+
+    # Step 4: Optional DeepEMD Per-Node Channel Mean Centering
+    if use_center_norm:
+      X_q_c = X_q_raw - X_q_raw.mean(dim=-1, keepdim=True)
+      X_s_c = X_s_raw - X_s_raw.mean(dim=-1, keepdim=True)
+      X_q = F.normalize(X_q_c, p=2, dim=-1)
+      X_s_app = F.normalize(X_s_c, p=2, dim=-1)
+    else:
+      X_q = F.normalize(X_q_raw, p=2, dim=-1)
+      X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
+
+    w_recon = torch.sigmoid(app_recon_alpha + 1.1)
+    blended_global_cos = (1.0 - w_recon) * gnn_global_cos + w_recon * app_global_cos
+    global_cos = torch.where(pair_2d, blended_global_cos, gnn_global_cos)
+  else:
+    w_recon = None
+    W_q = None
+    W_s = None
+    X_q = None
+    X_s_app = None
+    pair_active = None
+
+  global_dist = 2.0 - 2.0 * global_cos
+
   cos_sim_gnn = torch.einsum("qid, sjd -> qsij", H_q, H_s)
   K_q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
+  K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
 
   # 1. Standalone GNN Branch Reconstruction Distance (for Dual-Loss Co-Training)
   scores_gnn = cos_sim_gnn * 10.0
@@ -105,227 +208,44 @@ def _recon_chunk_step(
       if W_s is not None
       else err_s_g.sum(dim=-1) / K_s_counts
   )
-  gnn_dist = 0.5 * (dist_q2s_g + dist_s2q_g)
+  local_gnn_dist = 0.5 * (dist_q2s_g + dist_s2q_g)
 
   # 2. Blended Multimodal Set Reconstruction Distance
   cos_sim = cos_sim_gnn
-  if (
-      X_q is not None
-      and X_s is not None
-      and pair_active is not None
-      and w_recon is not None
-  ):
-    app_cos_sim = torch.einsum("qid, sjd -> qsij", X_q, X_s)
+  if use_late_app:
+    app_cos_sim = torch.einsum("qid, sjd -> qsij", X_q, X_s_app)
     blended_cos = (1.0 - w_recon) * cos_sim_gnn + w_recon * app_cos_sim
     cos_sim = torch.where(pair_active, blended_cos, cos_sim_gnn)
 
   scores = cos_sim * 10.0
 
-  # Direction 1: Query -> Support
   A_q2s = torch.nan_to_num(
       F.softmax(scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9), dim=-1),
       nan=0.0,
   )
-  err_q = 2.0 - 2.0 * (A_q2s * cos_sim).sum(dim=-1)
-  err_q = err_q.masked_fill(~M_q.unsqueeze(1), 0.0)
-  if W_q is not None:
-    dist_q2s = (err_q * W_q).sum(dim=-1)
-  else:
-    dist_q2s = err_q.sum(dim=-1) / K_q_counts
+  err_q = (2.0 - 2.0 * (A_q2s * cos_sim).sum(dim=-1)).masked_fill(
+      ~M_q.unsqueeze(1), 0.0
+  )
+  dist_q2s = (
+      (err_q * W_q).sum(dim=-1)
+      if W_q is not None
+      else err_q.sum(dim=-1) / K_q_counts
+  )
 
-  # Direction 2: Support -> Query
   A_s2q = torch.nan_to_num(
       F.softmax(scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9), dim=-2),
       nan=0.0,
   )
-  err_s = 2.0 - 2.0 * (A_s2q * cos_sim).sum(dim=-2)
-  err_s = err_s.masked_fill(~M_s.unsqueeze(0), 0.0)
-  if W_s is not None:
-    dist_s2q = (err_s * W_s).sum(dim=-1)
-  else:
-    dist_s2q = err_s.sum(dim=-1) / K_s_counts
-
-  mm_dist = 0.5 * (dist_q2s + dist_s2q)
-  return torch.stack([mm_dist, gnn_dist], dim=0)
-
-
-def compute_cross_transformer_reconstruction_distance(
-    h1_final,
-    h2_final,
-    batch1,
-    batch2,
-    N_query,
-    N_support,
-    projector=None,
-    scale=None,
-    x1_app=None,
-    x2_app=None,
-    app_recon_alpha=None,
-    use_center_norm=False,
-    return_gnn_dist=False,
-    query_chunk_size=15,
-):
-  """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
-  h1_seeds = h1_final
-  h2_seeds = h2_final
-  batch1_seeds = batch1
-  batch2_seeds = batch2
-
-  if projector is not None and h1_seeds.size(-1) == projector[0].in_features:
-    all_seeds = torch.cat([h1_seeds, h2_seeds], dim=0)
-    proj_seeds = projector(all_seeds)
-    h1_seeds = proj_seeds[: h1_seeds.size(0)]
-    h2_seeds = proj_seeds[h1_seeds.size(0) :]
-
-  H_q_all, M_q_all = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
-  H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
-
-  # Global GNN Graph Anchor
-  h_q_global = F.normalize(
-      (H_q_all * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
+  err_s = (2.0 - 2.0 * (A_s2q * cos_sim).sum(dim=-2)).masked_fill(
+      ~M_s.unsqueeze(0), 0.0
   )
-  h_s_global = F.normalize((H_s * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1)
-  gnn_global_cos = torch.matmul(h_q_global, h_s_global.t())
-  gnn_global_dist = 2.0 - 2.0 * gnn_global_cos
-  global_cos = gnn_global_cos
-
-  H_q_all = F.normalize(H_q_all, p=2, dim=-1)
-  H_s = F.normalize(H_s, p=2, dim=-1)
-
-  use_late_app = (
-      app_recon_alpha is not None
-      and x1_app is not None
-      and x2_app is not None
+  dist_s2q = (
+      (err_s * W_s).sum(dim=-1)
+      if W_s is not None
+      else err_s.sum(dim=-1) / K_s_counts
   )
-  if use_late_app:
-    X_q_raw, _ = to_dense_batch(
-        x1_app, batch1_seeds, batch_size=N_query
-    )
-    X_s_raw, _ = to_dense_batch(
-        x2_app, batch2_seeds, batch_size=N_support
-    )
+  local_recon_dist = 0.5 * (dist_q2s + dist_s2q)
 
-    with torch.no_grad():
-      X_q_det = X_q_raw.detach()
-      X_s_det = X_s_raw.detach()
-      q_active_all = X_q_det.abs().sum(dim=(-2, -1)) > 0
-      s_active = X_s_det.abs().sum(dim=(-2, -1)) > 0
-
-      q_mean_det = F.normalize(
-          (X_q_det * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
-      )
-      s_mean_det = F.normalize(
-          (X_s_det * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
-      )
-
-      fg_wq = torch.einsum("qid, qd -> qi", X_q_det, q_mean_det).clamp(min=1e-3)
-      fg_wq = fg_wq.masked_fill(~M_q_all, 0.0)
-      fg_wq = fg_wq / fg_wq.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-      unif_wq = M_q_all.float() / M_q_all.sum(dim=-1, keepdim=True).clamp(min=1.0)
-      W_q_all = torch.where(
-          q_active_all.unsqueeze(-1), 0.5 * unif_wq + 0.5 * fg_wq, unif_wq
-      ).unsqueeze(1)
-
-      fg_ws = torch.einsum("sjd, sd -> sj", X_s_det, s_mean_det).clamp(min=1e-3)
-      fg_ws = fg_ws.masked_fill(~M_s, 0.0)
-      fg_ws = fg_ws / fg_ws.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-      unif_ws = M_s.float() / M_s.sum(dim=-1, keepdim=True).clamp(min=1.0)
-      W_s_all = torch.where(
-          s_active.unsqueeze(-1), 0.5 * unif_ws + 0.5 * fg_ws, unif_ws
-      ).unsqueeze(0)
-      pair_2d = q_active_all.unsqueeze(1) & s_active.unsqueeze(0)
-
-    q_mean = F.normalize(
-        (X_q_raw * M_q_all.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
-    )
-    s_mean = F.normalize(
-        (X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
-    )
-    app_global_cos = torch.matmul(q_mean, s_mean.t())
-
-    # Step 4: Optional DeepEMD Per-Node Channel Mean Centering
-    if use_center_norm:
-      X_q_c = X_q_raw - X_q_raw.mean(dim=-1, keepdim=True)
-      X_s_c = X_s_raw - X_s_raw.mean(dim=-1, keepdim=True)
-      X_q_all = F.normalize(X_q_c, p=2, dim=-1)
-      X_s_app = F.normalize(X_s_c, p=2, dim=-1)
-    else:
-      X_q_all = F.normalize(X_q_raw, p=2, dim=-1)
-      X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
-
-    w_recon = torch.sigmoid(app_recon_alpha + 1.1)
-    blended_global_cos = (1.0 - w_recon) * gnn_global_cos + w_recon * app_global_cos
-    global_cos = torch.where(pair_2d, blended_global_cos, gnn_global_cos)
-  else:
-    w_recon = None
-    W_s_all = None
-    X_q_all = None
-    X_s_app = None
-
-  global_dist = 2.0 - 2.0 * global_cos
-
-  K_s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
-  dist_chunks = []
-  use_ckpt = torch.is_grad_enabled() and (
-      H_q_all.requires_grad
-      or H_s.requires_grad
-      or (X_q_all is not None and X_q_all.requires_grad)
-  )
-
-  # Process queries in checkpointed chunks so 4D [chunk, N_s, L_q, L_s] tensors never OOM during backward()
-  for q0 in range(0, N_query, query_chunk_size):
-    q1 = min(q0 + query_chunk_size, N_query)
-    H_q = H_q_all[q0:q1]
-    M_q = M_q_all[q0:q1]
-
-    if use_late_app:
-      X_q_chunk = X_q_all[q0:q1]
-      pair_active = (
-          (q_active_all[q0:q1].unsqueeze(1) & s_active.unsqueeze(0))
-          .unsqueeze(-1)
-          .unsqueeze(-1)
-      )
-      W_q = W_q_all[q0:q1]
-    else:
-      X_q_chunk = None
-      pair_active = None
-      W_q = None
-
-    if use_ckpt:
-      chunk_dist = checkpoint(
-          _recon_chunk_step,
-          H_q,
-          H_s,
-          M_q,
-          M_s,
-          K_s_counts,
-          X_q_chunk,
-          X_s_app,
-          pair_active,
-          w_recon,
-          W_q,
-          W_s_all,
-          use_reentrant=False,
-      )
-    else:
-      chunk_dist = _recon_chunk_step(
-          H_q,
-          H_s,
-          M_q,
-          M_s,
-          K_s_counts,
-          X_q_chunk,
-          X_s_app,
-          pair_active,
-          w_recon,
-          W_q,
-          W_s_all,
-      )
-
-    dist_chunks.append(chunk_dist)
-
-  stacked = torch.cat(dist_chunks, dim=1)  # [2, N_q, N_s]
-  local_recon_dist, local_gnn_dist = stacked[0], stacked[1]
   mm_dist = 0.85 * local_recon_dist + 0.15 * global_dist
   gnn_dist = 0.85 * local_gnn_dist + 0.15 * gnn_global_dist
   if return_gnn_dist:
@@ -676,16 +596,6 @@ class GraphEncoder(nn.Module):
     e1 = self.edge_encoder(edge_attr1)
     e2 = self.edge_encoder(edge_attr2)
 
-    deg1 = degree(edge_index1[0], num_nodes=h1.size(0))
-    deg2 = degree(edge_index2[0], num_nodes=h2.size(0))
-    mask1 = (deg1 == 1) | (deg1 >= 3)
-    mask2 = (deg2 == 1) | (deg2 >= 3)
-
-    if not mask1.any():
-      mask1 = torch.ones_like(mask1)
-    if not mask2.any():
-      mask2 = torch.ones_like(mask2)
-
     a1, x1_app = self._encode_appearance(
         g1, batch=batch1
     )
@@ -701,9 +611,6 @@ class GraphEncoder(nn.Module):
     if self.use_app_edges and a1 is not None and a2 is not None:
       e1 = e1 + self._compute_edge_appearance(a1, edge_index1)
       e2 = e2 + self._compute_edge_appearance(a2, edge_index2)
-
-    batch1_seeds = batch1[mask1]
-    batch2_seeds = batch2[mask2]
 
     layer_outputs1 = []
     layer_outputs2 = []
@@ -734,30 +641,22 @@ class GraphEncoder(nn.Module):
       h1 = h1 + h1_in
       h2 = h2 + h2_in
 
-      h1_seeds = h1[mask1]
-      h2_seeds = h2[mask2]
-
       mu1_seeds, mu2_seeds = compute_pairwise_seed_residuals(
-          h1_seeds,
-          h2_seeds,
-          batch1_seeds,
-          batch2_seeds,
+          h1,
+          h2,
+          batch1,
+          batch2,
           N_query,
           N_support,
           self.scale,
       )
 
-      delta1 = torch.zeros_like(h1)
-      delta2 = torch.zeros_like(h2)
-      delta1[mask1] = self.node_update(
-          torch.cat([h1_seeds, self.proj_match(mu1_seeds)], dim=-1)
+      h1 = h1 + self.node_update(
+          torch.cat([h1, self.proj_match(mu1_seeds)], dim=-1)
       )
-      delta2[mask2] = self.node_update(
-          torch.cat([h2_seeds, self.proj_match(mu2_seeds)], dim=-1)
+      h2 = h2 + self.node_update(
+          torch.cat([h2, self.proj_match(mu2_seeds)], dim=-1)
       )
-
-      h1 = h1 + delta1
-      h2 = h2 + delta2
 
       # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors (After GMN seed update!)
       if self.use_full_app_prop and x1_app is not None and x2_app is not None:
