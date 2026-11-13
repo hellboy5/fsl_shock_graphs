@@ -13,7 +13,7 @@ vision:
 
 graph:
   # SWITCH: true for coarsened (*_coarse.pt), false for uncoarsened (*.pt)
-  use_coarse: false
+  use_coarse: true
   image_size: 84
   use_graph_local_norm: false
 
