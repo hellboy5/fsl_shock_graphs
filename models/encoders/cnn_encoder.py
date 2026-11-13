@@ -17,33 +17,27 @@ class VisionEncoder(nn.Module):
         drop_rate=0.1,
         hc_layers=(1, 2, 3),
         hc_radius_mode='disk_5pt',
-        hc_stage_l2norm=True,
-        hc_use_std=False,
         **kwargs,
     ):
         """
         Args:
             proj_feat_dim: Accepted for interface compatibility with multimodal_network
             drop_rate: Dropout rate for the ResNet-12 backbone
-            hc_layers: Int (e.g. 3 ->) or list of stage indices in {1,2,3,4}
+            hc_layers: Int (e.g. 3 -> [1,2,3]) or list of stage indices in {1,2,3,4}
             hc_radius_mode: 'none' | 'concat_r' | 'disk_5pt' | 'disk_9pt' | 'center_ring_concat'
-            hc_stage_l2norm: Whether to L2-normalize each stage slice before concatenation
-            hc_use_std: Whether to also compute standard deviation across disk sample points
         """
         super().__init__()
         keep_prob = 1.0 - float(drop_rate)
         self.cnn = resnet12(keep_prob=keep_prob)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
-        # Parse hc_layers from Hydra (supports int like 3 or list like)
+        # Parse hc_layers from Hydra (supports int like 3 or list like [1, 2, 3])
         if isinstance(hc_layers, int):
             self.hc_layers = list(range(1, hc_layers + 1))
         else:
             self.hc_layers = [int(i) for i in hc_layers]
 
         self.hc_radius_mode = str(hc_radius_mode).lower()
-        self.hc_stage_l2norm = bool(hc_stage_l2norm)
-        self.hc_use_std = bool(hc_use_std)
 
         # Compute exact output hypercolumn dimension per node for downstream GNN/MLP
         base_hc_dim = sum(STAGE_CHANNELS[l] for l in self.hc_layers)
@@ -68,8 +62,8 @@ class VisionEncoder(nn.Module):
 
     def _build_sampling_points(self, pos_xyr):
         """
-        Constructs sampling coordinates in grid space
-        from pos_xyr = (grid_x, grid_y, grid_r).
+        Constructs sampling coordinates [Total_Nodes, K_pts, 2] in [-1, 1] grid space
+        from pos_xyr [Total_Nodes, 3] = (grid_x, grid_y, grid_r).
         """
         gx, gy, gr = pos_xyr[:, 0], pos_xyr[:, 1], pos_xyr[:, 2]
         r_half = 0.5 * gr
@@ -95,31 +89,28 @@ class VisionEncoder(nn.Module):
                 dim=-1,
             )
 
-        coords = torch.stack([xs, ys], dim=-1).clamp(-1.0, 1.0)  #
+        coords = torch.stack([xs, ys], dim=-1).clamp(-1.0, 1.0)  # [Total_Nodes, K_pts, 2]
         return coords
 
-    def extract_hypercolumns(self, images, pos_xyr, batch_idx, return_std=False):
+    def extract_hypercolumns(self, images, pos_xyr, batch_idx):
         """
         Extracts multi-scale node hypercolumns for a batch of PyG shock graphs.
 
         Args:
-            images: normalized image tensor
-            pos_xyr: tensor of (grid_x, grid_y, grid_r) in
+            images: [B, 3, 84, 84] normalized image tensor
+            pos_xyr: [Total_Nodes, 3] tensor of (grid_x, grid_y, grid_r) in [-1, 1]
             batch_idx: [Total_Nodes] PyG batch index mapping each node to image b in [0, B-1]
-            return_std: If True, returns (hc, hc_std)
 
         Returns:
-            x_app (or (x_app, x_app_std) when return_std=True)
+            x_app [Total_Nodes, hc_out_dim]
         """
         stage_maps = self.cnn.forward_stages(images)
-        coords = self._build_sampling_points(pos_xyr)  #
+        coords = self._build_sampling_points(pos_xyr)  # [Total_Nodes, K_pts, 2]
 
-        # Pad variable node counts per graph to for batched grid_sample
+        # Pad variable node counts per graph to [B, N_max, K_pts, 2] for batched grid_sample
         coords_dense, mask = to_dense_batch(coords, batch_idx, batch_size=images.size(0))
 
         stage_feats = []
-        stage_stds = []
-        want_std = (self.hc_use_std or return_std) and (coords.size(1) > 1)
         for l in self.hc_layers:
             fmap = stage_maps[l]  # [B, C_l, H_l, W_l]
             # sampled: [B, C_l, N_max, K_pts]
@@ -135,18 +126,10 @@ class VisionEncoder(nn.Module):
                 # Separate center [idx 0] and mean of 4 ring points [idx 1..4]
                 center_feat = sampled[:, :, :, 0].permute(0, 2, 1)[mask]        # [Total_Nodes, C_l]
                 ring_feat = sampled[:, :, :, 1:].mean(dim=-1).permute(0, 2, 1)[mask]  # [Total_Nodes, C_l]
-                if self.hc_stage_l2norm:
-                    center_feat = F.normalize(center_feat, p=2, dim=-1)
-                    ring_feat = F.normalize(ring_feat, p=2, dim=-1)
-                node_stage = torch.cat([center_feat, ring_feat], dim=-1)       # [Total_Nodes, 2 * C_l]
+                node_stage = torch.cat([center_feat, ring_feat], dim=-1)        # [Total_Nodes, 2 * C_l]
             else:
                 # Average across the K_pts disk samples -> [Total_Nodes, C_l]
                 node_stage = sampled.mean(dim=-1).permute(0, 2, 1)[mask]
-                if self.hc_stage_l2norm:
-                    node_stage = F.normalize(node_stage, p=2, dim=-1)
-                if want_std:
-                    node_std = sampled.detach().std(dim=-1, unbiased=False).permute(0, 2, 1)[mask]
-                    stage_stds.append(node_std)
 
             stage_feats.append(node_stage)
 
@@ -156,7 +139,4 @@ class VisionEncoder(nn.Module):
             log_r = torch.log(pos_xyr[:, 2].clamp(min=1e-4)).unsqueeze(-1)
             hc = torch.cat([hc, log_r], dim=-1)
 
-        if return_std:
-            hc_std = torch.cat(stage_stds, dim=-1) if len(stage_stds) > 0 else None
-            return hc, hc_std
         return hc

@@ -57,28 +57,25 @@ class GraphClassificationModel(nn.Module):
 
   def __init__(self, cfg):
     super(GraphClassificationModel, self).__init__()
-    num_classes = int(getattr(cfg.dataset, "num_classes", 64))
-    g_hidden_dim = getattr(cfg.model, "graph_hidden_dim", 128)
-    g_proj_dim = getattr(cfg.model, "graph_proj_dim", 640)
+    num_classes = int(cfg.dataset.num_classes)
+    g_hidden_dim = cfg.model.graph_hidden_dim
+    g_proj_dim = cfg.model.graph_proj_dim
 
     self.encoder = GraphEncoder(
         node_feat_dim=cfg.model.node_feat_dim,
         edge_feat_dim=cfg.model.edge_feat_dim,
         hidden_dim=g_hidden_dim,
         proj_feat_dim=g_proj_dim,
-        gnn_type=getattr(cfg.model, "gnn_type", "GINE"),
         num_layers=cfg.model.num_layers,
-        dropout=cfg.model.dropout,
-        norm_type=getattr(cfg.model, "norm_type", "graph"),
-        pooling_method=getattr(cfg.model, "pooling_method", "mean"),
-        train_eps=getattr(cfg.model, "train_eps", True),
-        use_input_mlp=getattr(cfg.model, "use_input_mlp", True),
-        use_jk=getattr(cfg.model, "use_jk", True),
-        use_reconstruction_dist=getattr(
-            cfg.model, "use_reconstruction_dist", True
-        ),
+        gnn_dropout=cfg.model.gnn_dropout,
+        norm_type=cfg.model.norm_type,
+        pooling_method=cfg.model.pooling_method,
+        train_eps=cfg.model.train_eps,
+        use_input_mlp=cfg.model.use_input_mlp,
+        use_jk=cfg.model.use_jk,
+        use_reconstruction_dist=cfg.model.use_reconstruction_dist,
     )
-    scale = float(getattr(cfg.model, "pretrain_scale", 10.0))
+    scale = float(cfg.model.pretrain_cosine_scale)
     self.classifier = NormalizedLinear(g_proj_dim, num_classes, scale=scale)
 
   def forward(self, graph_batch):
@@ -127,14 +124,14 @@ def run_pretraining(cfg, device):
   save_dir = cfg.training.save_dir
   os.makedirs(os.path.join(save_dir, "checkpoints"), exist_ok=True)
 
-  epochs = int(getattr(cfg.training, "epochs", 60))
-  batch_size = int(getattr(cfg.training, "batch_size", 128))
-  num_workers = int(getattr(cfg.training, "num_workers", 4))
+  epochs = int(cfg.training.epochs)
+  batch_size = int(cfg.training.batch_size)
+  num_workers = int(cfg.training.num_workers)
 
-  val_n_way = int(getattr(cfg.task, "n_way", 5))
-  val_n_shot = int(getattr(cfg.task, "n_shot", 1))
-  val_n_query = int(getattr(cfg.task, "n_query", 15))
-  val_episodes = int(getattr(cfg.task, "val_episodes", 200))
+  val_n_way = int(cfg.task.n_way)
+  val_n_shot = int(cfg.task.n_shot)
+  val_n_query = int(cfg.task.n_query)
+  val_episodes = int(cfg.task.val_episodes)
 
   g_transform = get_graph_transform(cfg)
 
@@ -195,16 +192,15 @@ def run_pretraining(cfg, device):
 
   model = GraphClassificationModel(cfg).to(device)
 
-  lr = float(getattr(cfg.training, "lr", 0.001))
-  wd = float(getattr(cfg.training, "weight_decay", 0.0001))
+  lr = float(cfg.training.lr)
+  wd = float(cfg.training.weight_decay)
   optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
   scheduler = optim.lr_scheduler.CosineAnnealingLR(
       optimizer, T_max=epochs, eta_min=1e-6
   )
   print(f"--> [Pretrain Optimizer: AdamW] lr={lr}, weight_decay={wd}")
 
-  smoothing = float(getattr(cfg.training, "label_smoothing", 0.0))
-  criterion = nn.CrossEntropyLoss(label_smoothing=smoothing)
+  criterion = nn.CrossEntropyLoss()
   best_val_acc = 0.0
 
   print("\n" + "=" * 80)

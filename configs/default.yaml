@@ -14,72 +14,55 @@ task:
   n_way: 5
   n_shot: 1
   n_query: 15
-  train_episodes: 2000
-  val_episodes: 300
+  train_episodes: 500
+  val_episodes: 600
   test_episodes: 10000
 
-# Model Architecture Configuration (Gold Baseline: 4L Uncoarsened GINE + Mean + Set Recon)
+# Model Architecture Configuration (Champion: 4L Coarse GINE h128 + Set Recon)
 model:
-  modality: "graph"             # Options: 'graph', 'vision', 'multimodal'
+  modality: "multimodal"        # Options: 'graph', 'vision', 'multimodal'
   fsl_method: "gmn"             # Options: 'protonet' (Stage 1), 'gmn' (Stage 2)
-  vision_checkpoint: null       # Path to pretrained RFS ResNet-12 checkpoint (for hypercolumns)
-  freeze_vision: true           # Keep pretrained RFS backbone frozen
-  unfreeze_vision_layer4: false # Pillar 1: Unfreeze Conv2d weights in ResNet-12 layer4 during Stage 2
+  vision_checkpoint: "checkpoints/pretrained_resnet12/resnet12_deepemd_pretrain.pth"
   num_layers: 4
   graph_hidden_dim: 128
   graph_proj_dim: 640
   node_feat_dim: 11
   edge_feat_dim: 14
-  dropout: 0.1
+  gnn_dropout: 0.1              # Feature dropout inside intermediate GINE layers & app_input_mlp
   norm_type: "graph"            # Options: 'graph', 'layer', 'batch'
   pooling_method: "mean"        # Options: 'mean', 'global_attention'
   train_eps: true
   use_input_mlp: true
   use_jk: true
   use_reconstruction_dist: true # true = Unpooled Set Reconstruction, false = Global Pooled cdist
-  use_sinkhorn: false           # Pillar 3: Doubly stochastic Sinkhorn-Knopp in dist_recon
-  sinkhorn_iters: 3             # Number of Sinkhorn row/col scaling iterations
   distance_metric: "cosine"     # Used when fsl_method == 'protonet'
-  pretrain_scale: 10.0          # Cosine logit multiplier (scale * cos)
-  scale: 5.0                    # Logit multiplier (-scale * dist for GMN; scale * cos for ProtoNet)
-  learnable_scale: false
+  pretrain_cosine_scale: 10.0   # Stage 1 64-class cosine logit multiplier (scale * cos)
+  gmn_dist_scale: 5.0           # Stage 2 GMN distance logit multiplier (-scale * dist)
 
   # --- Visual Hypercolumn Extraction Settings ---
-  hc_layers: [3, 4]               # ResNet-12 stages to concat: e.g. [3, 4], [2, 3, 4], [1, 2, 3, 4], [4]
-  hc_unfreeze_layers: []          # ResNet-12 stages to fine-tune in Stage 2: [] (frozen), [4], [3, 4]
-  hc_no_maxpool_layers: []        # ResNet-12 stages that skip final MaxPool2d(2): [], [4] (10x10), [3, 4] (21x21)
-  hc_radius_mode: "disk_5pt"      # "none" | "concat_r" | "disk_5pt" | "disk_9pt" | "center_ring_concat"
-  hc_stage_l2norm: false          # false preserves Stage-4 semantic dominance over earlier stages
-  hc_use_std: false               # Pillar 4: Compute per-node standard deviation across disk sample points
+  hc_layers: [2, 3, 4]          # ResNet stages to concat (1,120-D)
+  hc_unfreeze_layers: [4]       # ResNet stages to fine-tune in Stage 2: [] (frozen), [4], [3, 4]
+  hc_radius_mode: "disk_5pt"    # "none" | "concat_r" | "disk_5pt" | "disk_9pt" | "center_ring_concat"
 
   # --- Multimodal Appearance Fusion Toggles ---
-  app_mlp_dim: 128                # Pillar 2: Intermediate hidden dim of app_input_mlp (128, 256, 384)
-  app_node_scope: "all"           # "all" (all graph nodes) | "seeds_only" (only deg==1 or deg>=3)
-  recon_node_scope: "all"         # "all" (all nodes in final dist_recon) | "seeds_only" (only deg==1 or deg>=3)
-  app_dropout: 0.35               # Drop appearance on 35% of graphs during training to prevent modality collapse
-  use_direct_app: false           # Steps 1 & 2: Direct 9-D node salience & 10-D edge contrast (no app_input_mlp)
-  use_full_app_prop: false        # Step 3: Propagate full 1,120-D x_app across GNN hops
-  use_center_norm: false          # Step 4: DeepEMD per-node channel mean centering in dist_recon
-  use_app_node_input: true        # Option 1: Add zero-init appearance residual to initial node features
-  use_app_edges: false            # Option 2: Add zero-init edge appearance contrast |a_u - a_v| to edges
-  use_app_film: false             # Option 3: Per-layer FiLM modulation (1 + gamma) * h + beta
-  use_app_cross_match: false      # Option 4: Include appearance similarity in GMN cross-graph seed attention
-  use_app_recon_fusion: false     # Option 5: Add zero-init appearance residual to 640-D seed keypoints in dist_recon
+  app_mlp_dim: 256              # Intermediate hidden dim of app_input_mlp (128, 256, 384)
+  app_graph_dropout: 0.35       # Whole-graph modality dropout on x_app during training
+  use_app_node_input: true      # Option 1: Gated appearance residual on initial node features
+  use_app_edges: true           # Option 2: Gated edge appearance contrast |a_u - a_v| on edges
+  use_app_recon_fusion: true    # Option 5: 75/25 appearance + GNN fusion in dist_recon
+  use_full_app_prop: false      # Propagate full 1,120-D x_app across GNN hops
+  use_center_norm: false        # Per-channel mean centering in dist_recon
 
 # Training Hyperparameters
 training:
-  epochs: 60
+  epochs: 10                    # Stage 2 default (pass training.epochs=60 for Stage 1 'pretrain')
   batch_size: 128               # Used in Stage 1 'pretrain'
   lr: 0.001                     # Stage 1 pre-training learning rate
-  backbone_lr: 0.0001           # Stage 2 GMN GINE backbone learning rate (1e-4)
-  matching_lr: 0.0001           # Stage 2 GMN matching head learning rate (1e-3)
-  vision_lr: 0.00001            # Pillar 1: Stage 2 ResNet-12 layer4 learning rate (1e-5)
-  co_train_alpha: 0.0           # Weight for auxiliary GNN-branch co-training loss (e.g. 0.5)
+  backbone_lr: 0.00002          # Stage 2 GMN GINE backbone learning rate (2e-5)
+  matching_lr: 0.0005           # Stage 2 GMN matching head learning rate (5e-4)
+  vision_lr: 0.00001            # Stage 2 unfrozen ResNet-12 stages learning rate (1e-5)
+  co_train_alpha: 0.5           # Weight for auxiliary GNN-branch co-training loss
   weight_decay: 0.001           # AdamW weight decay
-  label_smoothing: 0.0          # Used in Stage 1 'pretrain'
-  use_hard_mining: false        # Enable Batch-Hard Triplet Margin in GMNEpisodicLoss
-  triplet_margin: 0.2
-  lambda_triplet: 0.2
   save_dir: "experiments"
   num_workers: 4
 

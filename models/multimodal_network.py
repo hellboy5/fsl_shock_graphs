@@ -25,38 +25,19 @@ class MultimodalFewShotNetwork(nn.Module):
     self.last_gnn_logits = None
 
     # --- 1. Vision Pathway (Used for vision baseline or frozen RFS/DeepEMD hypercolumns) ---
-    self.freeze_vision = bool(getattr(cfg.model, 'freeze_vision', False))
-    self.unfreeze_vision_layer4 = bool(
-        getattr(cfg.model, 'unfreeze_vision_layer4', False)
-    )
     self.hc_unfreeze_layers = [
-        int(s) for s in getattr(cfg.model, 'hc_unfreeze_layers', [])
+        int(s) for s in cfg.model.hc_unfreeze_layers
     ]
-    if self.unfreeze_vision_layer4 and 4 not in self.hc_unfreeze_layers:
-      self.hc_unfreeze_layers.append(4)
-    self.hc_no_maxpool_layers = [
-        int(s) for s in getattr(cfg.model, 'hc_no_maxpool_layers', [])
-    ]
-    self.hc_use_std = bool(getattr(cfg.model, 'hc_use_std', False))
     if self.modality in ['vision', 'multimodal']:
       self.vision_encoder = VisionEncoder(
-          drop_rate=getattr(cfg.model, 'dropout', 0.1),
-          hc_layers=getattr(cfg.model, 'hc_layers', [1, 2, 3]),
-          hc_radius_mode=getattr(cfg.model, 'hc_radius_mode', 'disk_5pt'),
-          hc_stage_l2norm=bool(getattr(cfg.model, 'hc_stage_l2norm', True)),
-          hc_use_std=self.hc_use_std,
+          drop_rate=cfg.model.gnn_dropout,
+          hc_layers=cfg.model.hc_layers,
+          hc_radius_mode=cfg.model.hc_radius_mode,
       )
-      v_ckpt = getattr(cfg.model, 'vision_checkpoint', None)
+      v_ckpt = cfg.model.vision_checkpoint
       if v_ckpt:
         self.load_checkpoint(
             self.vision_encoder.cnn, v_ckpt, 'vision_encoder.cnn'
-        )
-      if len(self.hc_no_maxpool_layers) > 0:
-        self.vision_encoder.cnn.configure_high_res_stages(
-            self.hc_no_maxpool_layers
-        )
-        print(
-            f'--> [MultimodalNetwork] Skipped MaxPool2d on stages {self.hc_no_maxpool_layers}.'
         )
       if len(self.hc_unfreeze_layers) > 0:
         self.vision_encoder.eval()
@@ -78,7 +59,7 @@ class MultimodalFewShotNetwork(nn.Module):
         print(
             f'--> [MultimodalNetwork] Vision BN frozen; unfroze {unfrozen_cnt} Conv2d tensors in stages {self.hc_unfreeze_layers}.'
         )
-      elif self.freeze_vision:
+      else:
         self.vision_encoder.eval()
         for p in self.vision_encoder.parameters():
           p.requires_grad = False
@@ -86,8 +67,8 @@ class MultimodalFewShotNetwork(nn.Module):
 
     # --- 2. Graph / GMN Pathway ---
     if self.modality in ['graph', 'multimodal']:
-      g_hidden_dim = getattr(cfg.model, 'graph_hidden_dim', 128)
-      g_proj_dim = getattr(cfg.model, 'graph_proj_dim', None) or g_hidden_dim
+      g_hidden_dim = cfg.model.graph_hidden_dim
+      g_proj_dim = cfg.model.graph_proj_dim or g_hidden_dim
       app_feat_dim = (
           self.vision_encoder.hc_out_dim if self.modality == 'multimodal' else 0
       )
@@ -97,47 +78,26 @@ class MultimodalFewShotNetwork(nn.Module):
           edge_feat_dim=cfg.model.edge_feat_dim,
           hidden_dim=g_hidden_dim,
           proj_feat_dim=g_proj_dim,
-          gnn_type=getattr(cfg.model, 'gnn_type', 'GINE'),
           num_layers=cfg.model.num_layers,
-          dropout=cfg.model.dropout,
-          norm_type=getattr(cfg.model, 'norm_type', 'graph'),
-          pooling_method=getattr(cfg.model, 'pooling_method', 'mean'),
-          train_eps=getattr(cfg.model, 'train_eps', True),
-          use_input_mlp=getattr(cfg.model, 'use_input_mlp', True),
-          use_jk=getattr(cfg.model, 'use_jk', True),
-          use_reconstruction_dist=getattr(
-              cfg.model, 'use_reconstruction_dist', True
-          ),
-          use_sinkhorn=getattr(cfg.model, 'use_sinkhorn', False),
-          sinkhorn_iters=getattr(cfg.model, 'sinkhorn_iters', 3),
-          use_direct_app=getattr(cfg.model, 'use_direct_app', False),
-          use_full_app_prop=getattr(cfg.model, 'use_full_app_prop', False),
-          use_center_norm=getattr(cfg.model, 'use_center_norm', False),
+          gnn_dropout=cfg.model.gnn_dropout,
+          norm_type=cfg.model.norm_type,
+          pooling_method=cfg.model.pooling_method,
+          train_eps=cfg.model.train_eps,
+          use_input_mlp=cfg.model.use_input_mlp,
+          use_jk=cfg.model.use_jk,
+          use_reconstruction_dist=cfg.model.use_reconstruction_dist,
+          use_full_app_prop=cfg.model.use_full_app_prop,
+          use_center_norm=cfg.model.use_center_norm,
           app_feat_dim=app_feat_dim,
-          app_mlp_dim=getattr(cfg.model, 'app_mlp_dim', g_hidden_dim),
-          hc_use_std=self.hc_use_std,
-          app_node_scope=getattr(cfg.model, 'app_node_scope', 'all'),
-          recon_node_scope=getattr(cfg.model, 'recon_node_scope', 'all'),
-          app_dropout=getattr(cfg.model, 'app_dropout', 0.2),
-          use_app_node_input=getattr(cfg.model, 'use_app_node_input', True),
-          use_app_edges=getattr(cfg.model, 'use_app_edges', False),
-          use_app_film=getattr(cfg.model, 'use_app_film', False),
-          use_app_cross_match=getattr(cfg.model, 'use_app_cross_match', False),
-          use_app_recon_fusion=getattr(
-              cfg.model, 'use_app_recon_fusion', False
-          ),
+          app_mlp_dim=cfg.model.app_mlp_dim,
+          app_graph_dropout=cfg.model.app_graph_dropout,
+          use_app_node_input=cfg.model.use_app_node_input,
+          use_app_edges=cfg.model.use_app_edges,
+          use_app_recon_fusion=cfg.model.use_app_recon_fusion,
       )
-      g_ckpt = getattr(cfg.model, 'graph_checkpoint', None)
-      if g_ckpt:
-        self.load_checkpoint(self.graph_encoder, g_ckpt, 'graph_encoder')
-      if getattr(cfg.model, 'freeze_graph', False):
-        for p in self.graph_encoder.parameters():
-          p.requires_grad = False
-        self.graph_encoder.eval()
-        print('--> [MultimodalNetwork] Graph encoder frozen.')
 
     # --- 3. Few-Shot Metric Head ---
-    self.scale = float(getattr(cfg.model, 'scale', 5.0))
+    self.scale = float(cfg.model.gmn_dist_scale)
 
     if self.fsl_method == 'gmn':
       if self.modality not in ['graph', 'multimodal']:
@@ -150,19 +110,14 @@ class MultimodalFewShotNetwork(nn.Module):
 
     self.classifier = FewShotClassifier(
         method=classifier_method,
-        distance=getattr(cfg.model, 'distance_metric', 'cosine'),
+        distance=cfg.model.distance_metric,
         scale=self.scale,
-        learnable_scale=getattr(cfg.model, 'learnable_scale', False),
     )
 
   def train(self, mode: bool = True):
     """Keeps frozen vision encoder BatchNorm and DropBlock in eval mode during training."""
     super().train(mode)
-    if self.modality in ['vision', 'multimodal'] and (
-        self.freeze_vision
-        or self.unfreeze_vision_layer4
-        or len(self.hc_unfreeze_layers) > 0
-    ):
+    if self.modality in ['vision', 'multimodal']:
       self.vision_encoder.eval()
     return self
 
@@ -243,28 +198,14 @@ class MultimodalFewShotNetwork(nn.Module):
     )
 
   def attach_node_hypercolumns(self, vision_batch, graph_batch):
-    """Samples (x, y, r) hypercolumns (and optional disk std) from vision_batch onto graph_batch."""
-    need_grad = (
-        (not self.freeze_vision)
-        or self.unfreeze_vision_layer4
-        or (len(self.hc_unfreeze_layers) > 0)
-    )
+    """Samples (x, y, r) hypercolumns from vision_batch onto graph_batch."""
+    need_grad = len(self.hc_unfreeze_layers) > 0
     with torch.set_grad_enabled(need_grad and self.training):
-      if self.hc_use_std:
-        x_app, x_app_std = self.vision_encoder.extract_hypercolumns(
-            vision_batch,
-            graph_batch.pos_xyr,
-            graph_batch.batch,
-            return_std=True,
-        )
-      else:
-        x_app = self.vision_encoder.extract_hypercolumns(
-            vision_batch,
-            graph_batch.pos_xyr,
-            graph_batch.batch,
-            return_std=False,
-        )
-        x_app_std = None
+      x_app = self.vision_encoder.extract_hypercolumns(
+          vision_batch,
+          graph_batch.pos_xyr,
+          graph_batch.batch,
+      )
 
     graph_batch.x_app = x_app
     if hasattr(graph_batch, '_slice_dict') and 'x' in graph_batch._slice_dict:
@@ -272,16 +213,6 @@ class MultimodalFewShotNetwork(nn.Module):
       graph_batch._inc_dict['x_app'] = torch.zeros_like(
           graph_batch._inc_dict['x']
       )
-
-    if x_app_std is not None:
-      graph_batch.x_app_std = x_app_std
-      if hasattr(graph_batch, '_slice_dict') and 'x' in graph_batch._slice_dict:
-        graph_batch._slice_dict['x_app_std'] = (
-            graph_batch._slice_dict['x'].clone()
-        )
-        graph_batch._inc_dict['x_app_std'] = torch.zeros_like(
-            graph_batch._inc_dict['x']
-        )
     return graph_batch
 
   def extract_fused_features(self, vision_batch, graph_batch):
@@ -306,7 +237,7 @@ class MultimodalFewShotNetwork(nn.Module):
       batch_q = Batch.from_data_list(graph_list[num_support:]).to(device)
 
       dist_matrix, _, _ = self.graph_encoder.forward_gmn(batch_q, batch_s)
-      gnn_dist = getattr(self.graph_encoder, 'last_gnn_dist', None)
+      gnn_dist = self.graph_encoder.last_gnn_dist
 
       if k_shot > 1:
         dist_matrix = dist_matrix.view(

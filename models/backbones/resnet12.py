@@ -85,12 +85,6 @@ class BasicBlock(nn.Module):
 
         self.dropblock = DropBlock(block_size=self.block_size)
 
-    def set_dilation(self, dilation: int):
-        d = int(dilation)
-        for conv in (self.conv1, self.conv2, self.conv3):
-            conv.dilation = (d, d)
-            conv.padding = (d, d)
-
     def forward(self, x):
         residual = self.downsample(x)
 
@@ -126,7 +120,7 @@ class ResNet12(nn.Module):
       - DropBlock enabled on Block 3 and Block 4 with keep_prob=0.9
       - Input resolution: (B, 3, 84, 84) -> Spatial Output: (B, 640, 5, 5)
     """
-    def __init__(self, keep_prob=0.9, block_size=5, no_maxpool_layers=()):
+    def __init__(self, keep_prob=0.9, block_size=5):
         super(ResNet12, self).__init__()
         self.in_planes = 3
 
@@ -136,9 +130,6 @@ class ResNet12(nn.Module):
         self.layer3 = BasicBlock(160, 320, keep_prob=keep_prob, block_size=block_size)
         self.layer4 = BasicBlock(320, 640, keep_prob=keep_prob, block_size=block_size)
 
-        if no_maxpool_layers:
-            self.configure_high_res_stages(no_maxpool_layers)
-
         # Weight initialization following standard PyTorch practices
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -146,19 +137,6 @@ class ResNet12(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
-
-    def configure_high_res_stages(self, no_maxpool_layers):
-        """Skips final MaxPool2d(2) on requested stages and adjusts downstream dilation."""
-        no_mp = set(int(s) for s in no_maxpool_layers) if no_maxpool_layers else set()
-        stages = {1: self.layer1, 2: self.layer2, 3: self.layer3, 4: self.layer4}
-        cum_dilation = 1
-        for s in (1, 2, 3, 4):
-            stages[s].set_dilation(cum_dilation)
-            if s in no_mp:
-                stages[s].maxpool = nn.Identity()
-                cum_dilation *= 2
-            else:
-                stages[s].maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
 
     def forward(self, x):
         """
@@ -186,9 +164,8 @@ class ResNet12(nn.Module):
         f4 = self.layer4(f3)
         return {1: f1, 2: f2, 3: f3, 4: f4}
 
-
-def resnet12(keep_prob=0.9, block_size=5, no_maxpool_layers=(), **kwargs):
+def resnet12(keep_prob=0.9, block_size=5, **kwargs):
     """
     Constructs a standard ResNet-12 backbone.
     """
-    return ResNet12(keep_prob=keep_prob, block_size=block_size, no_maxpool_layers=no_maxpool_layers)
+    return ResNet12(keep_prob=keep_prob, block_size=block_size)

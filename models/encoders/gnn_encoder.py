@@ -15,9 +15,6 @@ def compute_pairwise_seed_residuals(
     N_query,
     N_support,
     scale,
-    a1_seeds=None,
-    a2_seeds=None,
-    app_match_logit=None,
 ):
   """Computes isolated pairwise cross-attention residuals strictly within each (q, s) pair."""
   H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
@@ -28,27 +25,6 @@ def compute_pairwise_seed_residuals(
 
   # Pairwise cosine similarity strictly between Query q and Support s: [N_q, N_s, K_q, K_s]
   cos_sim = torch.einsum("qid, sjd -> qsij", H_q_norm, H_s_norm)
-
-  # Option 4: Appearance-Guided Cross-Graph Seed Matching (Projection-Free)
-  if (
-      a1_seeds is not None
-      and a2_seeds is not None
-      and app_match_logit is not None
-  ):
-    with torch.no_grad():
-      A_q, _ = to_dense_batch(a1_seeds, batch1_seeds, batch_size=N_query)
-      A_s, _ = to_dense_batch(a2_seeds, batch2_seeds, batch_size=N_support)
-      q_act = A_q.abs().sum(dim=(-2, -1)) > 0
-      s_act = A_s.abs().sum(dim=(-2, -1)) > 0
-      pair_act = (
-          (q_act.unsqueeze(1) & s_act.unsqueeze(0)).unsqueeze(-1).unsqueeze(-1)
-      )
-      A_q_norm = F.normalize(A_q, p=2, dim=-1)
-      A_s_norm = F.normalize(A_s, p=2, dim=-1)
-      app_cos_sim = torch.einsum("qid, sjd -> qsij", A_q_norm, A_s_norm)
-    w_app = 0.5 * torch.tanh(app_match_logit)
-    blended_sim = (1.0 - w_app) * cos_sim + w_app * app_cos_sim
-    cos_sim = torch.where(pair_act, blended_sim, cos_sim)
 
   scores = cos_sim * 5.0
 
@@ -85,38 +61,6 @@ def compute_pairwise_seed_residuals(
   return mu1_seeds, mu2_seeds
 
 
-def _build_recon_mask(seed_mask, batch, num_graphs, max_nodes=256):
-  """Returns all nodes up to `max_nodes` per graph (keeping 100% of seeds + uniform degree-2 stride on outliers)."""
-  counts = torch.bincount(batch, minlength=num_graphs)
-  if int(counts.max().item()) <= max_nodes:
-    return torch.ones_like(seed_mask, dtype=torch.bool)
-
-  recon_mask = seed_mask.clone()
-  for g in range(num_graphs):
-    c = int(counts[g].item())
-    if c <= max_nodes:
-      recon_mask[batch == g] = True
-    else:
-      g_idx = torch.where(batch == g)[0]
-      g_seeds = seed_mask[g_idx]
-      n_seeds = int(g_seeds.sum().item())
-      if n_seeds >= max_nodes:
-        seed_pos = g_idx[g_seeds]
-        recon_mask[g_idx] = False
-        step = torch.linspace(
-            0, len(seed_pos) - 1, steps=max_nodes, device=seed_mask.device
-        ).long()
-        recon_mask[seed_pos[step]] = True
-      else:
-        rem = max_nodes - n_seeds
-        non_seed_pos = g_idx[~g_seeds]
-        step = torch.linspace(
-            0, len(non_seed_pos) - 1, steps=rem, device=seed_mask.device
-        ).long()
-        recon_mask[non_seed_pos[step]] = True
-  return recon_mask
-
-
 def _recon_chunk_step(
     H_q,
     H_s,
@@ -125,14 +69,10 @@ def _recon_chunk_step(
     K_s_counts,
     X_q=None,
     X_s=None,
-    X_q_std=None,
-    X_s_std=None,
     pair_active=None,
     w_recon=None,
     W_q=None,
     W_s=None,
-    use_sinkhorn=False,
-    sinkhorn_iters=3,
 ):
   """Single query-chunk set reconstruction step returning stacked [mm_dist, gnn_dist]."""
   cos_sim_gnn = torch.einsum("qid, sjd -> qsij", H_q, H_s)
@@ -176,52 +116,10 @@ def _recon_chunk_step(
       and w_recon is not None
   ):
     app_cos_sim = torch.einsum("qid, sjd -> qsij", X_q, X_s)
-    if X_q_std is not None and X_s_std is not None:
-      std_cos_sim = torch.einsum("qid, sjd -> qsij", X_q_std, X_s_std)
-      app_cos_sim = 0.80 * app_cos_sim + 0.20 * std_cos_sim
     blended_cos = (1.0 - w_recon) * cos_sim_gnn + w_recon * app_cos_sim
     cos_sim = torch.where(pair_active, blended_cos, cos_sim_gnn)
 
   scores = cos_sim * 10.0
-
-  if use_sinkhorn:
-    valid_mask = M_q.unsqueeze(1).unsqueeze(3) & M_s.unsqueeze(0).unsqueeze(2)
-    log_P = scores.masked_fill(~valid_mask, -1e9)
-
-    if W_q is not None:
-      log_wq = W_q.clamp(min=1e-6).log().unsqueeze(-1)
-    else:
-      unif_q = M_q.float() / K_q_counts
-      log_wq = unif_q.clamp(min=1e-6).log().unsqueeze(1).unsqueeze(-1)
-
-    if W_s is not None:
-      log_ws = W_s.clamp(min=1e-6).log().unsqueeze(-2)
-    else:
-      unif_s = M_s.float() / K_s_counts.t()
-      log_ws = unif_s.clamp(min=1e-6).log().unsqueeze(0).unsqueeze(-2)
-
-    log_P_row = log_P
-    log_P_col = log_P
-    for _ in range(int(sinkhorn_iters)):
-      log_P_row = (
-          log_P_col - torch.logsumexp(log_P_col, dim=-1, keepdim=True) + log_wq
-      )
-      log_P_row = log_P_row.masked_fill(~valid_mask, -1e9)
-      log_P_col = (
-          log_P_row - torch.logsumexp(log_P_row, dim=-2, keepdim=True) + log_ws
-      )
-      log_P_col = log_P_col.masked_fill(~valid_mask, -1e9)
-
-    Pi_q2s = (
-        torch.nan_to_num(torch.exp(log_P_row), nan=0.0) * valid_mask.float()
-    )
-    Pi_s2q = (
-        torch.nan_to_num(torch.exp(log_P_col), nan=0.0) * valid_mask.float()
-    )
-    dist_q2s = 2.0 - 2.0 * (Pi_q2s * cos_sim).sum(dim=(-2, -1))
-    dist_s2q = 2.0 - 2.0 * (Pi_s2q * cos_sim).sum(dim=(-2, -1))
-    mm_dist = 0.5 * (dist_q2s + dist_s2q)
-    return torch.stack([mm_dist, gnn_dist], dim=0)
 
   # Direction 1: Query -> Support
   A_q2s = torch.nan_to_num(
@@ -254,8 +152,6 @@ def _recon_chunk_step(
 def compute_cross_transformer_reconstruction_distance(
     h1_final,
     h2_final,
-    mask1,
-    mask2,
     batch1,
     batch2,
     N_query,
@@ -264,21 +160,16 @@ def compute_cross_transformer_reconstruction_distance(
     scale=None,
     x1_app=None,
     x2_app=None,
-    x1_app_std=None,
-    x2_app_std=None,
     app_recon_alpha=None,
-    use_sinkhorn=False,
-    sinkhorn_iters=3,
     use_center_norm=False,
-    use_app_only_recon=False,
     return_gnn_dist=False,
     query_chunk_size=15,
 ):
   """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
-  h1_seeds = h1_final[mask1]
-  h2_seeds = h2_final[mask2]
-  batch1_seeds = batch1[mask1]
-  batch2_seeds = batch2[mask2]
+  h1_seeds = h1_final
+  h2_seeds = h2_final
+  batch1_seeds = batch1
+  batch2_seeds = batch2
 
   if projector is not None and h1_seeds.size(-1) == projector[0].in_features:
     all_seeds = torch.cat([h1_seeds, h2_seeds], dim=0)
@@ -308,10 +199,10 @@ def compute_cross_transformer_reconstruction_distance(
   )
   if use_late_app:
     X_q_raw, _ = to_dense_batch(
-        x1_app[mask1], batch1_seeds, batch_size=N_query
+        x1_app, batch1_seeds, batch_size=N_query
     )
     X_s_raw, _ = to_dense_batch(
-        x2_app[mask2], batch2_seeds, batch_size=N_support
+        x2_app, batch2_seeds, batch_size=N_support
     )
 
     with torch.no_grad():
@@ -362,23 +253,7 @@ def compute_cross_transformer_reconstruction_distance(
       X_q_all = F.normalize(X_q_raw, p=2, dim=-1)
       X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
 
-    if x1_app_std is not None and x2_app_std is not None:
-      X_q_std_raw, _ = to_dense_batch(
-          x1_app_std[mask1], batch1_seeds, batch_size=N_query
-      )
-      X_s_std_raw, _ = to_dense_batch(
-          x2_app_std[mask2], batch2_seeds, batch_size=N_support
-      )
-      X_q_std_all = F.normalize(X_q_std_raw, p=2, dim=-1)
-      X_s_std_app = F.normalize(X_s_std_raw, p=2, dim=-1)
-    else:
-      X_q_std_all = None
-      X_s_std_app = None
-
-    if use_app_only_recon:
-      w_recon = torch.tensor(1.0, device=H_q_all.device, dtype=H_q_all.dtype)
-    else:
-      w_recon = torch.sigmoid(app_recon_alpha + 1.1)
+    w_recon = torch.sigmoid(app_recon_alpha + 1.1)
     blended_global_cos = (1.0 - w_recon) * gnn_global_cos + w_recon * app_global_cos
     global_cos = torch.where(pair_2d, blended_global_cos, gnn_global_cos)
   else:
@@ -386,8 +261,6 @@ def compute_cross_transformer_reconstruction_distance(
     W_s_all = None
     X_q_all = None
     X_s_app = None
-    X_q_std_all = None
-    X_s_std_app = None
 
   global_dist = 2.0 - 2.0 * global_cos
 
@@ -407,7 +280,6 @@ def compute_cross_transformer_reconstruction_distance(
 
     if use_late_app:
       X_q_chunk = X_q_all[q0:q1]
-      X_q_std_chunk = X_q_std_all[q0:q1] if X_q_std_all is not None else None
       pair_active = (
           (q_active_all[q0:q1].unsqueeze(1) & s_active.unsqueeze(0))
           .unsqueeze(-1)
@@ -416,7 +288,6 @@ def compute_cross_transformer_reconstruction_distance(
       W_q = W_q_all[q0:q1]
     else:
       X_q_chunk = None
-      X_q_std_chunk = None
       pair_active = None
       W_q = None
 
@@ -430,14 +301,10 @@ def compute_cross_transformer_reconstruction_distance(
           K_s_counts,
           X_q_chunk,
           X_s_app,
-          X_q_std_chunk,
-          X_s_std_app,
           pair_active,
           w_recon,
           W_q,
           W_s_all,
-          use_sinkhorn,
-          sinkhorn_iters,
           use_reentrant=False,
       )
     else:
@@ -449,14 +316,10 @@ def compute_cross_transformer_reconstruction_distance(
           K_s_counts,
           X_q_chunk,
           X_s_app,
-          X_q_std_chunk,
-          X_s_std_app,
           pair_active,
           w_recon,
           W_q,
           W_s_all,
-          use_sinkhorn,
-          sinkhorn_iters,
       )
 
     dist_chunks.append(chunk_dist)
@@ -479,67 +342,45 @@ class GraphEncoder(nn.Module):
       edge_feat_dim=14,
       hidden_dim=128,
       proj_feat_dim=640,
-      gnn_type="GINE",
       num_layers=4,
-      dropout=0.1,
+      gnn_dropout=0.1,
       norm_type="graph",
       pooling_method="mean",
       train_eps=True,
       use_input_mlp=True,
       use_jk=True,
       use_reconstruction_dist=True,
-      use_sinkhorn=False,
-      sinkhorn_iters=3,
-      use_direct_app=False,
       use_full_app_prop=False,
       use_center_norm=False,
-      use_app_only_recon=False,
       app_feat_dim=0,
       app_mlp_dim=None,
-      hc_use_std=False,
-      app_node_scope="all",
-      recon_node_scope="all",
-      app_dropout=0.2,
+      app_graph_dropout=0.35,
       use_app_node_input=True,
       use_app_edges=False,
-      use_app_film=False,
-      use_app_cross_match=False,
       use_app_recon_fusion=False,
       **kwargs,
   ):
     super(GraphEncoder, self).__init__()
-    self.gnn_type = gnn_type
     self.use_jk = use_jk
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
     self.proj_feat_dim = proj_feat_dim
-    self.dropout = float(dropout)
+    self.gnn_dropout = float(gnn_dropout)
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)
     self.use_reconstruction_dist = use_reconstruction_dist
-    self.use_sinkhorn = bool(use_sinkhorn)
-    self.sinkhorn_iters = int(sinkhorn_iters)
     self.use_center_norm = bool(use_center_norm)
-    self.use_app_only_recon = bool(use_app_only_recon)
     self.last_gnn_dist = None
 
     self.app_feat_dim = int(app_feat_dim)
     self.app_mlp_dim = (
         int(app_mlp_dim) if app_mlp_dim is not None else int(hidden_dim)
     )
-    self.hc_use_std = bool(hc_use_std)
-    self.app_node_scope = str(app_node_scope).lower()
-    self.recon_node_scope = str(recon_node_scope).lower()
-    self.app_dropout = float(app_dropout)
+    self.app_graph_dropout = float(app_graph_dropout)
 
-    self.use_direct_app = bool(use_direct_app) and self.app_feat_dim > 0
     self.use_full_app_prop = bool(use_full_app_prop) and self.app_feat_dim > 0
     self.use_app_node_input = bool(use_app_node_input) and self.app_feat_dim > 0
     self.use_app_edges = bool(use_app_edges) and self.app_feat_dim > 0
-    self.use_app_film = bool(use_app_film) and self.app_feat_dim > 0
-    self.use_app_cross_match = (
-        bool(use_app_cross_match) and self.app_feat_dim > 0
-    )
     self.use_app_recon_fusion = (
         bool(use_app_recon_fusion) and self.app_feat_dim > 0
     )
@@ -623,79 +464,37 @@ class GraphEncoder(nn.Module):
     nn.init.zeros_(self.node_update[-1].bias)
 
     # 6. Visual Appearance Fusion Heads (All prefixed with `app_` for LR routing)
-    if self.use_direct_app:
-      # --- Direct Full-1,120-D Mode (No app_input_mlp compression!) ---
-      # Step 1 (Optional via use_app_node_input): 9-D Node Salience -> Linear(9, 128)
-      if self.use_app_node_input:
-        self.app_node_salience_mlp = nn.Sequential(
-            nn.LayerNorm(9),
-            nn.Linear(9, hidden_dim, bias=False),
-            nn.LayerNorm(hidden_dim, elementwise_affine=False),
-        )
-        self.app_node_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
-
-      # Step 2 (via use_app_edges): 10-D Edge Contrast -> Linear(10, 128)
-      if self.use_app_edges:
-        self.app_edge_contrast_mlp = nn.Sequential(
-            nn.LayerNorm(10),
-            nn.Linear(10, hidden_dim, bias=False),
-            nn.LayerNorm(hidden_dim, elementwise_affine=False),
-        )
-        self.app_edge_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
-    else:
-      # --- Legacy MLP Stem Mode (Compresses 1,120-D -> app_mlp_dim -> 128-D) ---
-      needs_app_stem = (
-          self.use_app_node_input
-          or self.use_app_edges
-          or self.use_app_film
+    needs_app_stem = (
+        self.use_app_node_input
+        or self.use_app_edges
+    )
+    if needs_app_stem:
+      self.app_input_mlp = nn.Sequential(
+          nn.LayerNorm(self.app_feat_dim),
+          nn.Linear(self.app_feat_dim, self.app_mlp_dim),
+          nn.GELU(),
+          nn.Dropout(self.gnn_dropout),
+          nn.Linear(self.app_mlp_dim, hidden_dim),
+          nn.LayerNorm(hidden_dim),
+          nn.GELU(),
       )
-      if needs_app_stem:
-        self.app_input_mlp = nn.Sequential(
-            nn.LayerNorm(self.app_feat_dim),
-            nn.Linear(self.app_feat_dim, self.app_mlp_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.app_mlp_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
-        if self.hc_use_std:
-          self.app_std_mlp = nn.Sequential(
-              nn.LayerNorm(self.app_feat_dim),
-              nn.Linear(self.app_feat_dim, 32),
-              nn.GELU(),
-              nn.Linear(32, hidden_dim, bias=False),
-              nn.LayerNorm(hidden_dim, elementwise_affine=False),
-          )
-          self.app_std_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
 
-      if self.use_app_node_input:
-        self.app_node_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim, bias=False),
-            nn.LayerNorm(hidden_dim, elementwise_affine=False),
-        )
-        self.app_node_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
-
-      if self.use_app_edges:
-        self.app_edge_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=False),
-            nn.LayerNorm(hidden_dim, elementwise_affine=False),
-        )
-        self.app_edge_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
-
-    if self.use_app_film:
-      self.app_film_layers = nn.ModuleList(
-          [nn.Linear(hidden_dim, hidden_dim * 2) for _ in range(num_layers)]
+    if self.use_app_node_input:
+      self.app_node_gate = nn.Sequential(
+          nn.Linear(hidden_dim, hidden_dim, bias=False),
+          nn.LayerNorm(hidden_dim, elementwise_affine=False),
       )
-      for film_lin in self.app_film_layers:
-        nn.init.zeros_(film_lin.weight)
-        nn.init.zeros_(film_lin.bias)
+      self.app_node_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
 
-    if self.use_app_cross_match:
-      self.app_match_logit = nn.Parameter(torch.tensor(0.0))
+    if self.use_app_edges:
+      self.app_edge_mlp = nn.Sequential(
+          nn.Linear(hidden_dim * 2, hidden_dim),
+          nn.LayerNorm(hidden_dim),
+          nn.GELU(),
+          nn.Linear(hidden_dim, hidden_dim, bias=False),
+          nn.LayerNorm(hidden_dim, elementwise_affine=False),
+      )
+      self.app_edge_alpha = nn.Parameter(torch.zeros(1, hidden_dim))
 
     if self.use_app_recon_fusion:
       self.app_recon_alpha = nn.Parameter(torch.tensor(0.0))
@@ -723,145 +522,32 @@ class GraphEncoder(nn.Module):
       return self.pool_op(x_final, batch)
     return global_mean_pool(x_final, batch)
 
-  def _get_stage_slices(self, x_app):
-    D = x_app.size(-1)
-    if D == 1120:
-      return [x_app[:, :160], x_app[:, 160:480], x_app[:, 480:]]
-    elif D == 960:
-      return [x_app[:, :320], x_app[:, 320:], x_app]
-    return [x_app, x_app, x_app]
-
-  def _compute_direct_node_salience(self, x_app, batch):
-    """Step 1: Computes 9-D channel-invariant node salience directly from full 1,120-D x_app."""
-    with torch.no_grad():
-      x_det = x_app.detach()
-      active = (x_det.abs().sum(dim=-1, keepdim=True) > 0).type_as(x_app)
-      num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 1
-      slices = self._get_stage_slices(x_det)
-      feats = []
-      for sl in slices:
-        norms = sl.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
-        mean_n = scatter(
-            norms, batch, dim=0, dim_size=num_graphs, reduce="mean"
-        )[batch].clamp(min=1e-6)
-        e_is = norms / mean_n
-
-        g_mean = F.normalize(
-            scatter(sl, batch, dim=0, dim_size=num_graphs, reduce="mean"),
-            p=2,
-            dim=-1,
-        )
-        c_is = (
-            F.normalize(sl, p=2, dim=-1) * g_mean[batch]
-        ).sum(dim=-1, keepdim=True)
-
-        p_is = sl.max(dim=-1, keepdim=True)[0] / (
-            sl.abs().mean(dim=-1, keepdim=True) + 1e-5
-        )
-        feats.extend([e_is, c_is, p_is])
-      s_vec = torch.cat(feats, dim=-1) * active
-
-    active_mask = (x_app.detach().abs().sum(dim=-1, keepdim=True) > 0).type_as(
-        x_app
-    )
-    return (
-        torch.tanh(self.app_node_alpha)
-        * self.app_node_salience_mlp(s_vec)
-        * active_mask
-    )
-
-  def _compute_direct_edge_contrast(self, x_app, edge_index, batch):
-    """Step 2: Computes 10-D boundary contrast directly from full 1,120-D vectors across edges (u, v)."""
-    src, dst = edge_index[0], edge_index[1]
-    with torch.no_grad():
-      x_det = x_app.detach()
-      u_act = x_det[src].abs().sum(dim=-1, keepdim=True) > 0
-      v_act = x_det[dst].abs().sum(dim=-1, keepdim=True) > 0
-      edge_active = (u_act & v_act).type_as(x_app)
-
-      slices = self._get_stage_slices(x_det)
-      edge_feats = []
-      for sl in slices:
-        sl_n = F.normalize(sl, p=2, dim=-1)
-        u_n, v_n = sl_n[src], sl_n[dst]
-        cos_uv = (u_n * v_n).sum(dim=-1, keepdim=True)
-        l2_uv = (u_n - v_n).norm(p=2, dim=-1, keepdim=True)
-        edge_feats.extend([cos_uv, l2_uv])
-
-      full_n = F.normalize(x_det, p=2, dim=-1)
-      full_cos = (full_n[src] * full_n[dst]).sum(dim=-1, keepdim=True)
-
-      x_c = F.normalize(
-          x_det - x_det.mean(dim=-1, keepdim=True), p=2, dim=-1
-      )
-      full_corr = (x_c[src] * x_c[dst]).sum(dim=-1, keepdim=True)
-
-      n_u = x_det[src].norm(p=2, dim=-1, keepdim=True)
-      n_v = x_det[dst].norm(p=2, dim=-1, keepdim=True)
-      energy_jump = (n_u - n_v).abs() / (n_u + n_v + 1e-5)
-
-      num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 1
-      sl4 = slices[-1]
-      g_mean4 = F.normalize(
-          scatter(sl4, batch, dim=0, dim_size=num_graphs, reduce="mean"),
-          p=2,
-          dim=-1,
-      )
-      c4 = (
-          F.normalize(sl4, p=2, dim=-1) * g_mean4[batch]
-      ).sum(dim=-1, keepdim=True)
-      cent_jump = (c4[src] - c4[dst]).abs()
-
-      edge_feats.extend([full_cos, full_corr, energy_jump, cent_jump])
-      c_uv = torch.cat(edge_feats, dim=-1) * edge_active
-
-    return (
-        torch.tanh(self.app_edge_alpha)
-        * self.app_edge_contrast_mlp(c_uv)
-        * edge_active
-    )
-
-  def _encode_appearance(self, data, deg=None, batch=None):
+  def _encode_appearance(self, data, batch=None):
     if (
         self.app_feat_dim <= 0
         or not hasattr(data, "x_app")
         or data.x_app is None
     ):
-      return None, None, None
+      return None, None
 
     x_app = data.x_app
-    x_app_std = getattr(data, "x_app_std", None)
 
-    if self.training and self.app_dropout > 0.0 and batch is not None:
+    if self.training and self.app_graph_dropout > 0.0 and batch is not None:
       num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
       if num_graphs > 0:
-        keep_prob = 1.0 - self.app_dropout
+        keep_prob = 1.0 - self.app_graph_dropout
         graph_keep = (
             torch.rand(num_graphs, 1, device=x_app.device) < keep_prob
         ).type_as(x_app)
         mask_g = graph_keep[batch]
         x_app = x_app * mask_g
-        if x_app_std is not None:
-          x_app_std = x_app_std * mask_g
 
-    if not self.use_direct_app and hasattr(self, "app_input_mlp"):
+    if hasattr(self, "app_input_mlp"):
       a = self.app_input_mlp(x_app)
-      if hasattr(self, "app_std_mlp") and x_app_std is not None:
-        a = a + torch.tanh(self.app_std_alpha) * self.app_std_mlp(x_app_std)
     else:
       a = None
 
-    if self.app_node_scope == "seeds_only":
-      if deg is None:
-        deg = degree(data.edge_index[0], num_nodes=data.x.size(0))
-      seed_mask = ((deg == 1) | (deg >= 3)).unsqueeze(-1).type_as(x_app)
-      x_app = x_app * seed_mask
-      if x_app_std is not None:
-        x_app_std = x_app_std * seed_mask
-      if a is not None:
-        a = a * seed_mask
-
-    return a, x_app, x_app_std
+    return a, x_app
 
   def _compute_edge_appearance(self, a, edge_index):
     src, dst = edge_index[0], edge_index[1]
@@ -912,24 +598,15 @@ class GraphEncoder(nn.Module):
         data.batch,
     )
 
-    deg = degree(edge_index[0], num_nodes=x.size(0))
-    a, x_app, _ = self._encode_appearance(data, deg=deg, batch=batch)
+    a, x_app = self._encode_appearance(data, batch=batch)
 
     x = self.node_encoder(x)
     edge_attr = self.edge_encoder(edge_attr)
 
-    if self.use_direct_app:
-      if self.use_app_node_input and x_app is not None:
-        x = x + self._compute_direct_node_salience(x_app, batch)
-      if self.use_app_edges and x_app is not None:
-        edge_attr = edge_attr + self._compute_direct_edge_contrast(
-            x_app, edge_index, batch
-        )
-    else:
-      if self.use_app_node_input and a is not None:
-        x = x + torch.tanh(self.app_node_alpha) * self.app_node_gate(a)
-      if self.use_app_edges and a is not None:
-        edge_attr = edge_attr + self._compute_edge_appearance(a, edge_index)
+    if self.use_app_node_input and a is not None:
+      x = x + torch.tanh(self.app_node_alpha) * self.app_node_gate(a)
+    if self.use_app_edges and a is not None:
+      edge_attr = edge_attr + self._compute_edge_appearance(a, edge_index)
 
     layer_outputs = []
     for i, layer in enumerate(self.layers):
@@ -940,13 +617,10 @@ class GraphEncoder(nn.Module):
           if isinstance(self.norms[i], GraphNorm)
           else self.norms[i](x)
       )
-      if self.use_app_film and a is not None:
-        raw_gamma, raw_beta = self.app_film_layers[i](a).chunk(2, dim=-1)
-        x = (1.0 + 0.5 * torch.tanh(raw_gamma)) * x + 0.5 * torch.tanh(raw_beta)
       x = F.relu(x)
       
-      if i < self.num_layers - 1 and self.dropout > 0.0:
-        x = F.dropout(x, p=self.dropout, training=self.training)
+      if i < self.num_layers - 1 and self.gnn_dropout > 0.0:
+        x = F.dropout(x, p=self.gnn_dropout, training=self.training)
       
       x = x + x_in
       if self.use_full_app_prop and x_app is not None:
@@ -1012,50 +686,24 @@ class GraphEncoder(nn.Module):
     if not mask2.any():
       mask2 = torch.ones_like(mask2)
 
-    a1, x1_app, x1_app_std = self._encode_appearance(
-        g1, deg=deg1, batch=batch1
+    a1, x1_app = self._encode_appearance(
+        g1, batch=batch1
     )
-    a2, x2_app, x2_app_std = self._encode_appearance(
-        g2, deg=deg2, batch=batch2
+    a2, x2_app = self._encode_appearance(
+        g2, batch=batch2
     )
 
-    if self.use_direct_app:
-      if self.use_app_node_input and x1_app is not None and x2_app is not None:
-        h1 = h1 + self._compute_direct_node_salience(x1_app, batch1)
-        h2 = h2 + self._compute_direct_node_salience(x2_app, batch2)
-      if self.use_app_edges and x1_app is not None and x2_app is not None:
-        e1 = e1 + self._compute_direct_edge_contrast(
-            x1_app, edge_index1, batch1
-        )
-        e2 = e2 + self._compute_direct_edge_contrast(
-            x2_app, edge_index2, batch2
-        )
-    else:
-      if self.use_app_node_input and a1 is not None and a2 is not None:
-        gate_node = torch.tanh(self.app_node_alpha)
-        h1 = h1 + gate_node * self.app_node_gate(a1)
-        h2 = h2 + gate_node * self.app_node_gate(a2)
+    if self.use_app_node_input and a1 is not None and a2 is not None:
+      gate_node = torch.tanh(self.app_node_alpha)
+      h1 = h1 + gate_node * self.app_node_gate(a1)
+      h2 = h2 + gate_node * self.app_node_gate(a2)
 
-      if self.use_app_edges and a1 is not None and a2 is not None:
-        e1 = e1 + self._compute_edge_appearance(a1, edge_index1)
-        e2 = e2 + self._compute_edge_appearance(a2, edge_index2)
+    if self.use_app_edges and a1 is not None and a2 is not None:
+      e1 = e1 + self._compute_edge_appearance(a1, edge_index1)
+      e2 = e2 + self._compute_edge_appearance(a2, edge_index2)
 
     batch1_seeds = batch1[mask1]
     batch2_seeds = batch2[mask2]
-
-    a1_seeds = (
-        x1_app[mask1]
-        if (self.use_app_cross_match and x1_app is not None)
-        else None
-    )
-    a2_seeds = (
-        x2_app[mask2]
-        if (self.use_app_cross_match and x2_app is not None)
-        else None
-    )
-    app_match_logit = (
-        self.app_match_logit if self.use_app_cross_match else None
-    )
 
     layer_outputs1 = []
     layer_outputs2 = []
@@ -1078,17 +726,11 @@ class GraphEncoder(nn.Module):
           else self.norms[i](h2)
       )
 
-      if self.use_app_film and a1 is not None and a2 is not None:
-        raw_g1, raw_b1 = self.app_film_layers[i](a1).chunk(2, dim=-1)
-        raw_g2, raw_b2 = self.app_film_layers[i](a2).chunk(2, dim=-1)
-        h1 = (1.0 + 0.5 * torch.tanh(raw_g1)) * h1 + 0.5 * torch.tanh(raw_b1)
-        h2 = (1.0 + 0.5 * torch.tanh(raw_g2)) * h2 + 0.5 * torch.tanh(raw_b2)
-
       h1 = F.relu(h1)
       h2 = F.relu(h2)
-      if i < self.num_layers - 1 and self.dropout > 0.0:
-        h1 = F.dropout(h1, p=self.dropout, training=self.training)
-        h2 = F.dropout(h2, p=self.dropout, training=self.training)
+      if i < self.num_layers - 1 and self.gnn_dropout > 0.0:
+        h1 = F.dropout(h1, p=self.gnn_dropout, training=self.training)
+        h2 = F.dropout(h2, p=self.gnn_dropout, training=self.training)
       h1 = h1 + h1_in
       h2 = h2 + h2_in
 
@@ -1103,9 +745,6 @@ class GraphEncoder(nn.Module):
           N_query,
           N_support,
           self.scale,
-          a1_seeds=a1_seeds,
-          a2_seeds=a2_seeds,
-          app_match_logit=app_match_logit,
       )
 
       delta1 = torch.zeros_like(h1)
@@ -1137,19 +776,10 @@ class GraphEncoder(nn.Module):
     h2_final = torch.cat(layer_outputs2, dim=-1) if self.use_jk else h2
 
     if self.use_reconstruction_dist:
-      if self.recon_node_scope == "all":
-        recon_mask1 = _build_recon_mask(mask1, batch1, N_query, max_nodes=256)
-        recon_mask2 = _build_recon_mask(mask2, batch2, N_support, max_nodes=256)
-      else:
-        recon_mask1 = mask1
-        recon_mask2 = mask2
-
       # Step 4: Centered Set Reconstruction + Standalone GNN Distance for Co-Training
       dist, gnn_dist = compute_cross_transformer_reconstruction_distance(
           h1_final=h1_final,
           h2_final=h2_final,
-          mask1=recon_mask1,
-          mask2=recon_mask2,
           batch1=batch1,
           batch2=batch2,
           N_query=N_query,
@@ -1158,15 +788,10 @@ class GraphEncoder(nn.Module):
           scale=self.scale,
           x1_app=x1_app if self.use_app_recon_fusion else None,
           x2_app=x2_app if self.use_app_recon_fusion else None,
-          x1_app_std=x1_app_std if self.use_app_recon_fusion else None,
-          x2_app_std=x2_app_std if self.use_app_recon_fusion else None,
           app_recon_alpha=(
               self.app_recon_alpha if self.use_app_recon_fusion else None
           ),
-          use_sinkhorn=self.use_sinkhorn,
-          sinkhorn_iters=self.sinkhorn_iters,
           use_center_norm=self.use_center_norm,
-          use_app_only_recon=self.use_app_only_recon,
           return_gnn_dist=True,
       )
       self.last_gnn_dist = gnn_dist

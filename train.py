@@ -4,10 +4,10 @@ import random
 from data.dataset import MultimodalFSLDataset
 from data.samplers import EpisodicBatchSampler
 from data.transforms import get_graph_transform, get_vision_transform
-from losses.gmn_loss import GMNEpisodicLoss
 from models.multimodal_network import MultimodalFewShotNetwork
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
@@ -95,7 +95,7 @@ def run_training(cfg, device):
       ' episodes (indices only) across all epochs.'
   )
 
-  num_workers = int(getattr(cfg.training, 'num_workers', 4))
+  num_workers = int(cfg.training.num_workers)
   g = torch.Generator()
   g.manual_seed(cfg.seed)
 
@@ -125,8 +125,8 @@ def run_training(cfg, device):
   model = MultimodalFewShotNetwork(cfg).to(device)
 
   # --- Warm-Start Checkpoint Loading ---
-  ckpt_path = getattr(cfg, 'checkpoint_path', None)
-  has_loaded_checkpoint = bool(getattr(cfg.model, 'graph_checkpoint', None))
+  ckpt_path = cfg.checkpoint_path
+  has_loaded_checkpoint = False
 
   if ckpt_path:
     print(f'--> [Warm-Start] Loading pre-trained weights from: {ckpt_path}')
@@ -163,7 +163,7 @@ def run_training(cfg, device):
     )
 
   # --- Optimizer Routing (AdamW) ---
-  wd = float(getattr(cfg.training, 'weight_decay', 0.0001))
+  wd = float(cfg.training.weight_decay)
 
   if has_loaded_checkpoint and cfg.model.fsl_method == 'gmn':
     # Re-zero final layer of node_update in case Stage 1 checkpoint saved random init weights
@@ -184,15 +184,15 @@ def run_training(cfg, device):
         vision_params.append(param)
       elif any(
           k in name
-          for k in ('proj_match', 'node_update', 'app_', 'film_', 'zero_')
+          for k in ('proj_match', 'node_update', 'app_')
       ):
         matching_params.append(param)
       else:
         backbone_params.append(param)
 
-    b_lr = float(getattr(cfg.training, 'backbone_lr', 1e-4))
-    m_lr = float(getattr(cfg.training, 'matching_lr', 1e-3))
-    v_lr = float(getattr(cfg.training, 'vision_lr', 1e-5))
+    b_lr = float(cfg.training.backbone_lr)
+    m_lr = float(cfg.training.matching_lr)
+    v_lr = float(cfg.training.vision_lr)
     param_groups = [
         {'params': backbone_params, 'lr': b_lr, 'weight_decay': wd},
         {'params': matching_params, 'lr': m_lr, 'weight_decay': wd},
@@ -231,15 +231,9 @@ def run_training(cfg, device):
       .to(device, non_blocking=True)
   )
   best_val_acc = 0.0
-  scale = float(getattr(cfg.model, 'scale', 5.0))
-  co_train_alpha = float(getattr(cfg.training, 'co_train_alpha', 0.0))
+  co_train_alpha = float(cfg.training.co_train_alpha)
 
-  criterion = GMNEpisodicLoss(
-      tau=1.0 / scale,
-      margin=float(getattr(cfg.training, 'triplet_margin', 0.2)),
-      use_hard_mining=bool(getattr(cfg.training, 'use_hard_mining', False)),
-      lambda_triplet=float(getattr(cfg.training, 'lambda_triplet', 0.2)),
-  ).to(device)
+  criterion = nn.CrossEntropyLoss().to(device)
 
   print(
       f'--- Starting Training: {cfg.model.modality} modality | Seed: {cfg.seed}'
@@ -264,12 +258,12 @@ def run_training(cfg, device):
       )
 
       logits = model(img_batch, graph_batch, n_way, n_shot)
-      loss = criterion(logits, targets, is_distance=False)
+      loss = criterion(logits, targets)
 
       # Dual-Loss Co-Training: Direct auxiliary supervision on the GNN branch
-      gnn_logits = getattr(model, 'last_gnn_logits', None)
+      gnn_logits = model.last_gnn_logits
       if co_train_alpha > 0.0 and gnn_logits is not None:
-        gnn_loss = criterion(gnn_logits, targets, is_distance=False)
+        gnn_loss = criterion(gnn_logits, targets)
         loss = loss + co_train_alpha * gnn_loss
 
       loss.backward()
@@ -297,7 +291,7 @@ def run_training(cfg, device):
 
         logits = model(img_batch, graph_batch, n_way, n_shot)
         val_accs.append(calculate_accuracy(logits, targets))
-        if getattr(model, 'last_gnn_logits', None) is not None:
+        if model.last_gnn_logits is not None:
           gnn_val_accs.append(
               calculate_accuracy(model.last_gnn_logits, targets)
           )
