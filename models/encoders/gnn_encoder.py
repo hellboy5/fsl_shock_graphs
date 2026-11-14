@@ -73,6 +73,7 @@ def compute_cross_transformer_reconstruction_distance(
     x2_app=None,
     app_recon_alpha=None,
     use_center_norm=False,
+    app_running_mean=None,
     return_gnn_dist=False,
 ):
   """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
@@ -146,23 +147,21 @@ def compute_cross_transformer_reconstruction_distance(
       pair_2d = q_active_all.unsqueeze(1) & s_active.unsqueeze(0)
       pair_active = pair_2d.unsqueeze(-1).unsqueeze(-1)
 
-    q_mean = F.normalize(
-        (X_q_raw * M_q.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
-    )
-    s_mean = F.normalize(
-        (X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1
-    )
-    app_global_cos = torch.matmul(q_mean, s_mean.t())
-
-    # Step 4: Optional DeepEMD Per-Node Channel Mean Centering
-    if use_center_norm:
-      X_q_c = X_q_raw - X_q_raw.mean(dim=-1, keepdim=True)
-      X_s_c = X_s_raw - X_s_raw.mean(dim=-1, keepdim=True)
+    # Per-Channel [1, 1, D] Image-Level Running Mean Centering
+    if use_center_norm and app_running_mean is not None:
+      X_q_c = (X_q_raw - app_running_mean) * M_q.unsqueeze(-1)
+      X_s_c = (X_s_raw - app_running_mean) * M_s.unsqueeze(-1)
       X_q = F.normalize(X_q_c, p=2, dim=-1)
       X_s_app = F.normalize(X_s_c, p=2, dim=-1)
+      q_mean = F.normalize(X_q_c.sum(dim=1), p=2, dim=-1)
+      s_mean = F.normalize(X_s_c.sum(dim=1), p=2, dim=-1)
     else:
       X_q = F.normalize(X_q_raw, p=2, dim=-1)
       X_s_app = F.normalize(X_s_raw, p=2, dim=-1)
+      q_mean = F.normalize((X_q_raw * M_q.unsqueeze(-1)).sum(dim=1), p=2, dim=-1)
+      s_mean = F.normalize((X_s_raw * M_s.unsqueeze(-1)).sum(dim=1), p=2, dim=-1)
+
+    app_global_cos = torch.matmul(q_mean, s_mean.t())
 
     w_recon = torch.sigmoid(app_recon_alpha + 1.1)
     blended_global_cos = (1.0 - w_recon) * gnn_global_cos + w_recon * app_global_cos
@@ -419,6 +418,10 @@ class GraphEncoder(nn.Module):
     if self.use_app_recon_fusion:
       self.app_recon_alpha = nn.Parameter(torch.tensor(0.0))
 
+    if self.app_feat_dim > 0:
+      self.register_buffer("app_running_mean", torch.zeros(1, 1, self.app_feat_dim))
+      self.register_buffer("app_mean_init", torch.tensor(False))
+
     # Step 3: Nonlinear relational edge gates & active beta=0.23 init for 1,120-D propagation
     if self.use_full_app_prop:
       self.app_prop_gates = nn.ModuleList(
@@ -451,6 +454,22 @@ class GraphEncoder(nn.Module):
       return None, None
 
     x_app = data.x_app
+
+    if (
+        self.training
+        and self.use_center_norm
+        and hasattr(self, "app_running_mean")
+        and batch is not None
+        and x_app.numel() > 0
+    ):
+      with torch.no_grad():
+        img_means = global_mean_pool(x_app.detach(), batch)
+        batch_mean = img_means.mean(dim=0).view(1, 1, -1)
+        if not bool(self.app_mean_init.item()):
+          self.app_running_mean.copy_(batch_mean)
+          self.app_mean_init.fill_(True)
+        else:
+          self.app_running_mean.lerp_(batch_mean, 0.05)
 
     if self.training and self.app_graph_dropout > 0.0 and batch is not None:
       num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
@@ -691,6 +710,7 @@ class GraphEncoder(nn.Module):
               self.app_recon_alpha if self.use_app_recon_fusion else None
           ),
           use_center_norm=self.use_center_norm,
+          app_running_mean=getattr(self, "app_running_mean", None),
           return_gnn_dist=True,
       )
       self.last_gnn_dist = gnn_dist
