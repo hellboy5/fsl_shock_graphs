@@ -26,7 +26,6 @@ model:
   num_layers: 4
   graph_hidden_dim: 128
   graph_proj_dim: 640
-  gnn_proj_mode: "postpool_linear_bn" # Temp sweep: 'postpool_linear_bn' | 'none' | 'none_mean_center' | 'none_node_bn' | 'sacrificial_mlp' | 'prepool_linear_bn'
   node_feat_dim: 11
   edge_feat_dim: 14
   gnn_dropout: 0.1              # Feature dropout inside intermediate GINE layers & app_input_mlp
@@ -52,7 +51,7 @@ model:
   use_app_edges: true           # Option 2: Gated edge appearance contrast |a_u - a_v| on edges
   use_app_recon_fusion: true    # Option 5: 75/25 appearance + GNN fusion in dist_recon
   use_full_app_prop: false      # Propagate full 1,120-D x_app across GNN hops
-  use_center_norm: false        # Per-channel mean centering in dist_recon
+  use_center_norm: true         # Per-channel mean centering in dist_recon
 
 # Training Hyperparameters
 training:

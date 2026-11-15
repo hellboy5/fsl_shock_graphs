@@ -66,7 +66,6 @@ class GraphClassificationModel(nn.Module):
         edge_feat_dim=cfg.model.edge_feat_dim,
         hidden_dim=g_hidden_dim,
         proj_feat_dim=g_proj_dim,
-        gnn_proj_mode=cfg.model.gnn_proj_mode,
         num_layers=cfg.model.num_layers,
         gnn_dropout=cfg.model.gnn_dropout,
         norm_type=cfg.model.norm_type,
@@ -76,23 +75,11 @@ class GraphClassificationModel(nn.Module):
         use_jk=cfg.model.use_jk,
         use_reconstruction_dist=cfg.model.use_reconstruction_dist,
     )
-    out_dim = self.encoder.out_dim
-    if cfg.model.gnn_proj_mode == "sacrificial_mlp":
-      self.sacrificial_head = nn.Sequential(
-        nn.Linear(out_dim, out_dim, bias=False),
-        nn.BatchNorm1d(out_dim),
-        nn.ReLU(),
-        nn.Linear(out_dim, out_dim),
-      )
-    else:
-      self.sacrificial_head = None
     scale = float(cfg.model.pretrain_cosine_scale)
-    self.classifier = NormalizedLinear(out_dim, num_classes, scale=scale)
+    self.classifier = NormalizedLinear(self.encoder.out_dim, num_classes, scale=scale)
 
   def forward(self, graph_batch):
-    z = self.encoder(graph_batch)
-    if self.sacrificial_head is not None:
-      z = self.sacrificial_head(z)
+    z = self.encoder(graph_batch)  # [B, out_dim]
     logits = self.classifier(z)  # [B, num_classes]
     return logits, z
 
