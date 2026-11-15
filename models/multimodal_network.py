@@ -78,6 +78,7 @@ class MultimodalFewShotNetwork(nn.Module):
           edge_feat_dim=cfg.model.edge_feat_dim,
           hidden_dim=g_hidden_dim,
           proj_feat_dim=g_proj_dim,
+          gnn_proj_mode=cfg.model.gnn_proj_mode,
           num_layers=cfg.model.num_layers,
           gnn_dropout=cfg.model.gnn_dropout,
           norm_type=cfg.model.norm_type,

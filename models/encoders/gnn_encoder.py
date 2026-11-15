@@ -82,7 +82,7 @@ def compute_cross_transformer_reconstruction_distance(
   batch1_seeds = batch1
   batch2_seeds = batch2
 
-  if projector is not None and h1_seeds.size(-1) == projector[0].in_features:
+  if projector is not None:
     all_seeds = torch.cat([h1_seeds, h2_seeds], dim=0)
     proj_seeds = projector(all_seeds)
     h1_seeds = proj_seeds[: h1_seeds.size(0)]
@@ -261,6 +261,7 @@ class GraphEncoder(nn.Module):
       edge_feat_dim=14,
       hidden_dim=128,
       proj_feat_dim=640,
+      gnn_proj_mode="postpool_linear_bn",
       num_layers=4,
       gnn_dropout=0.1,
       norm_type="graph",
@@ -284,6 +285,7 @@ class GraphEncoder(nn.Module):
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
     self.proj_feat_dim = proj_feat_dim
+    self.gnn_proj_mode = str(gnn_proj_mode).lower()
     self.gnn_dropout = float(gnn_dropout)
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)
@@ -305,6 +307,12 @@ class GraphEncoder(nn.Module):
     )
 
     effective_dim = (hidden_dim * num_layers) if use_jk else hidden_dim
+    self.out_dim = (
+        proj_feat_dim
+        if self.gnn_proj_mode in ("postpool_linear_bn", "prepool_linear_bn")
+        else effective_dim
+    )
+    pool_in_dim = proj_feat_dim if self.gnn_proj_mode == "prepool_linear_bn" else effective_dim
 
     # 1. Input Encoders (Node & Edge Projections)
     if use_input_mlp:
@@ -360,17 +368,33 @@ class GraphEncoder(nn.Module):
     # 3. Pooling / Readout Setup
     if self.pooling_method == "global_attention":
       gate_nn = nn.Sequential(
-          nn.Linear(effective_dim, effective_dim // 2),
+          nn.Linear(pool_in_dim, pool_in_dim // 2),
           nn.ReLU(),
-          nn.Linear(effective_dim // 2, 1),
+          nn.Linear(pool_in_dim // 2, 1),
       )
       self.pool_op = GlobalAttention(gate_nn=gate_nn)
 
-    # 4. Output Projection Head to Metric Space (640D)
-    self.projector = nn.Sequential(
-        nn.Linear(effective_dim, proj_feat_dim),
-        nn.BatchNorm1d(proj_feat_dim),
-    )
+    # 4. Output Projection / Centering Head
+    if self.gnn_proj_mode == "postpool_linear_bn":
+      self.projector = nn.Sequential(
+          nn.Linear(effective_dim, proj_feat_dim),
+          nn.BatchNorm1d(proj_feat_dim),
+      )
+    elif self.gnn_proj_mode == "prepool_linear_bn":
+      self.projector = nn.Sequential(
+          nn.Linear(effective_dim, proj_feat_dim, bias=False),
+          nn.BatchNorm1d(proj_feat_dim, affine=False),
+      )
+    elif self.gnn_proj_mode == "none_node_bn":
+      self.projector = nn.BatchNorm1d(effective_dim, affine=False)
+    elif self.gnn_proj_mode in ("none", "sacrificial_mlp", "none_mean_center"):
+      self.projector = None
+    else:
+      raise ValueError(f"Unknown gnn_proj_mode: {self.gnn_proj_mode}")
+
+    if self.gnn_proj_mode == "none_mean_center":
+      self.register_buffer("gnn_running_mean", torch.zeros(1, effective_dim))
+      self.register_buffer("gnn_mean_init", torch.tensor(False))
 
     # 5. GMN Cross-Graph Matching Heads
     self.proj_match = nn.Linear(hidden_dim, hidden_dim)
@@ -444,6 +468,18 @@ class GraphEncoder(nn.Module):
     if self.pooling_method == "global_attention":
       return self.pool_op(x_final, batch)
     return global_mean_pool(x_final, batch)
+
+  def _center_gnn_nodes(self, h_nodes, batch):
+    if self.training and batch is not None and h_nodes.numel() > 0:
+      with torch.no_grad():
+        g_means = global_mean_pool(h_nodes.detach(), batch)
+        b_mean = g_means.mean(dim=0, keepdim=True)
+        if not bool(self.gnn_mean_init.item()):
+          self.gnn_running_mean.copy_(b_mean)
+          self.gnn_mean_init.fill_(True)
+        else:
+          self.gnn_running_mean.lerp_(b_mean, 0.05)
+    return h_nodes - self.gnn_running_mean
 
   def _encode_appearance(self, data, batch=None):
     if (
@@ -571,8 +607,16 @@ class GraphEncoder(nn.Module):
         layer_outputs.append(x)
 
     x_final = torch.cat(layer_outputs, dim=-1) if self.use_jk else x
+    if self.gnn_proj_mode == "none_mean_center":
+      x_final = self._center_gnn_nodes(x_final, batch)
+    if self.gnn_proj_mode in ("prepool_linear_bn", "none_node_bn"):
+      x_final = self.projector(x_final)
     pooled = self._apply_pooling(x_final, batch)
-    out = self.projector(pooled)
+    out = (
+        self.projector(pooled)
+        if self.gnn_proj_mode == "postpool_linear_bn"
+        else pooled
+    )
 
     if self.use_app_recon_fusion and x_app is not None:
       w = torch.sigmoid(self.app_recon_alpha + 1.1)
@@ -692,6 +736,9 @@ class GraphEncoder(nn.Module):
 
     h1_final = torch.cat(layer_outputs1, dim=-1) if self.use_jk else h1
     h2_final = torch.cat(layer_outputs2, dim=-1) if self.use_jk else h2
+    if self.gnn_proj_mode == "none_mean_center":
+      h1_final = self._center_gnn_nodes(h1_final, batch1)
+      h2_final = self._center_gnn_nodes(h2_final, batch2)
 
     if self.use_reconstruction_dist:
       # Step 4: Centered Set Reconstruction + Standalone GNN Distance for Co-Training
@@ -716,10 +763,17 @@ class GraphEncoder(nn.Module):
       self.last_gnn_dist = gnn_dist
       return dist, None, None
     else:
+      if self.gnn_proj_mode in ("prepool_linear_bn", "none_node_bn") and self.projector is not None:
+        all_n = torch.cat([h1_final, h2_final], dim=0)
+        p_n = self.projector(all_n)
+        h1_final, h2_final = p_n[: h1_final.size(0)], p_n[h1_final.size(0) :]
       pooled1 = self._apply_pooling(h1_final, batch1)
       pooled2 = self._apply_pooling(h2_final, batch2)
-      z1_norm = F.normalize(self.projector(pooled1), p=2, dim=-1)
-      z2_norm = F.normalize(self.projector(pooled2), p=2, dim=-1)
+      if self.gnn_proj_mode == "postpool_linear_bn" and self.projector is not None:
+        pooled1 = self.projector(pooled1)
+        pooled2 = self.projector(pooled2)
+      z1_norm = F.normalize(pooled1, p=2, dim=-1)
+      z2_norm = F.normalize(pooled2, p=2, dim=-1)
       self.last_gnn_dist = torch.cdist(z1_norm, z2_norm, p=2) ** 2
       if self.use_app_recon_fusion and x1_app is not None and x2_app is not None:
         w = torch.sigmoid(self.app_recon_alpha + 1.1)

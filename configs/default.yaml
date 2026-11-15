@@ -26,6 +26,7 @@ model:
   num_layers: 4
   graph_hidden_dim: 128
   graph_proj_dim: 640
+  gnn_proj_mode: "postpool_linear_bn" # Temp sweep: 'postpool_linear_bn' | 'none' | 'none_mean_center' | 'none_node_bn' | 'sacrificial_mlp' | 'prepool_linear_bn'
   node_feat_dim: 11
   edge_feat_dim: 14
   gnn_dropout: 0.1              # Feature dropout inside intermediate GINE layers & app_input_mlp
