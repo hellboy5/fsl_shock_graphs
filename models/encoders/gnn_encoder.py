@@ -2,8 +2,51 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GINEConv, GlobalAttention, GraphNorm, global_mean_pool
+from torch_geometric.nn import GINEConv, GlobalAttention, GraphNorm, MessagePassing, global_mean_pool
 from torch_geometric.utils import degree, scatter, softmax, to_dense_batch
+
+
+class GatedGINEConv(MessagePassing):
+  """Anisotropic Edge-Gated GINE layer preserving 1-WL sum aggregation."""
+
+  def __init__(self, nn_mlp, hidden_dim, train_eps=True):
+    super().__init__(aggr="add")
+    self.nn = nn_mlp
+    if train_eps:
+      self.eps = nn.Parameter(torch.zeros(1))
+    else:
+      self.register_buffer("eps", torch.zeros(1))
+    self.edge_gate = nn.Linear(hidden_dim * 3, hidden_dim)
+    nn.init.zeros_(self.edge_gate.weight)
+    nn.init.constant_(self.edge_gate.bias, 1.0)
+
+  def forward(self, x, edge_index, edge_attr):
+    out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
+    out = out + (1.0 + self.eps) * x
+    return self.nn(out)
+
+  def message(self, x_i, x_j, edge_attr):
+    gate = torch.sigmoid(
+        self.edge_gate(torch.cat([edge_attr, x_j, x_i], dim=-1))
+    )
+    return gate * F.relu(x_j + edge_attr)
+
+
+def _build_rev_edge_index(edge_index, num_nodes):
+  """Finds reverse edge indices (v -> u) for each directed edge (u -> v) without ordering assumptions."""
+  if edge_index.numel() == 0 or num_nodes <= 0:
+    return None, None
+  src, dst = edge_index[0].long(), edge_index[1].long()
+  key_uv = src * num_nodes + dst
+  key_vu = dst * num_nodes + src
+  perm = torch.argsort(key_uv)
+  sorted_keys = key_uv[perm]
+  pos = torch.searchsorted(sorted_keys, key_vu).clamp(
+      max=sorted_keys.numel() - 1
+  )
+  has_rev = sorted_keys[pos] == key_vu
+  rev_idx = perm[pos]
+  return rev_idx, has_rev
 
 
 def compute_pairwise_seed_residuals(
@@ -248,11 +291,22 @@ def compute_cross_transformer_reconstruction_distance(
 class GraphEncoder(nn.Module):
   """GINE & Graph Matching Network (GMN) Backbone with Modular & Direct Full-Vector Visual Fusion."""
 
+  VALID_EDGE_MODES = (
+      "none",
+      "co_update",
+      "gated_static",
+      "gated_co_update",
+      "nb_co_update",
+      "nb_gated_co_update",
+      "nb_gated_dual_jk",
+  )
+
   def __init__(
       self,
       node_feat_dim=11,
       edge_feat_dim=14,
       hidden_dim=128,
+      edge_prop_mode="none",
       num_layers=4,
       gnn_dropout=0.1,
       norm_type="graph",
@@ -275,6 +329,30 @@ class GraphEncoder(nn.Module):
     self.use_jk = use_jk
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
+    self.edge_prop_mode = str(edge_prop_mode).lower()
+    if self.edge_prop_mode not in self.VALID_EDGE_MODES:
+      raise ValueError(f"Unknown edge_prop_mode: {self.edge_prop_mode}")
+
+    self.use_edge_co_update = self.edge_prop_mode in (
+        "co_update",
+        "gated_co_update",
+        "nb_co_update",
+        "nb_gated_co_update",
+        "nb_gated_dual_jk",
+    )
+    self.use_edge_gate = self.edge_prop_mode in (
+        "gated_static",
+        "gated_co_update",
+        "nb_gated_co_update",
+        "nb_gated_dual_jk",
+    )
+    self.use_nb_relay = self.edge_prop_mode in (
+        "nb_co_update",
+        "nb_gated_co_update",
+        "nb_gated_dual_jk",
+    )
+    self.use_edge_readout = self.edge_prop_mode == "nb_gated_dual_jk"
+
     self.gnn_dropout = float(gnn_dropout)
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)
@@ -296,7 +374,7 @@ class GraphEncoder(nn.Module):
     )
 
     effective_dim = (hidden_dim * num_layers) if use_jk else hidden_dim
-    self.out_dim = effective_dim
+    self.out_dim = effective_dim * 2 if self.use_edge_readout else effective_dim
 
     # 1. Input Encoders (Node & Edge Projections)
     if use_input_mlp:
@@ -328,7 +406,7 @@ class GraphEncoder(nn.Module):
           nn.ReLU(),
       )
 
-    # 2. GINE Message Passing Convolution Layers
+    # 2. GINE / GatedGINE Message Passing & Dynamic Edge Co-Update Layers
     self.layers = nn.ModuleList()
     self.norms = nn.ModuleList()
 
@@ -338,9 +416,14 @@ class GraphEncoder(nn.Module):
           nn.ReLU(),
           nn.Linear(hidden_dim, hidden_dim),
       )
-      self.layers.append(
-          GINEConv(nn_mlp, edge_dim=hidden_dim, train_eps=train_eps)
-      )
+      if self.use_edge_gate:
+        self.layers.append(
+            GatedGINEConv(nn_mlp, hidden_dim=hidden_dim, train_eps=train_eps)
+        )
+      else:
+        self.layers.append(
+            GINEConv(nn_mlp, edge_dim=hidden_dim, train_eps=train_eps)
+        )
 
       if norm_type == "graph":
         self.norms.append(GraphNorm(hidden_dim))
@@ -349,17 +432,39 @@ class GraphEncoder(nn.Module):
       elif norm_type == "batch":
         self.norms.append(nn.BatchNorm1d(hidden_dim))
 
+    if self.use_edge_co_update:
+      num_edge_layers = (
+          num_layers if self.use_edge_readout else max(num_layers - 1, 1)
+      )
+      edge_in_dim = hidden_dim * 4 if self.use_nb_relay else hidden_dim * 3
+      self.edge_updaters = nn.ModuleList()
+      self.edge_norms = nn.ModuleList()
+      for _ in range(num_edge_layers):
+        self.edge_updaters.append(
+            nn.Sequential(
+                nn.Linear(edge_in_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        )
+        if norm_type == "graph":
+          self.edge_norms.append(GraphNorm(hidden_dim))
+        elif norm_type == "layer":
+          self.edge_norms.append(nn.LayerNorm(hidden_dim))
+        elif norm_type == "batch":
+          self.edge_norms.append(nn.BatchNorm1d(hidden_dim))
+
     # 3. Pooling / Readout Setup
     if self.pooling_method == "global_attention":
       gate_nn = nn.Sequential(
-          nn.Linear(effective_dim, effective_dim // 2),
+          nn.Linear(self.out_dim, self.out_dim // 2),
           nn.ReLU(),
-          nn.Linear(effective_dim // 2, 1),
+          nn.Linear(self.out_dim // 2, 1),
       )
       self.pool_op = GlobalAttention(gate_nn=gate_nn)
 
     # 4. Zero-Parameter GNN Output Mean Centering
-    self.register_buffer("gnn_running_mean", torch.zeros(1, effective_dim))
+    self.register_buffer("gnn_running_mean", torch.zeros(1, self.out_dim))
     self.register_buffer("gnn_mean_init", torch.tensor(False))
 
     # 5. GMN Cross-Graph Matching Heads
@@ -447,6 +552,38 @@ class GraphEncoder(nn.Module):
           self.gnn_running_mean.lerp_(b_mean, 0.05)
     return h_nodes - self.gnn_running_mean
 
+  def _update_edge_state(
+      self, e, x, edge_index, batch, layer_idx, rev_idx=None, has_rev=None
+  ):
+    if edge_index.numel() == 0:
+      return e
+    src, dst = edge_index[0], edge_index[1]
+    h_sum = x[src] + x[dst]
+    h_diff = x[dst] - x[src]
+    if self.use_nb_relay and rev_idx is not None and has_rev is not None:
+      num_nodes = x.size(0)
+      in_sum = scatter(e, dst, dim=0, dim_size=num_nodes, reduce="sum")
+      in_deg = degree(dst, num_nodes=num_nodes, dtype=e.dtype).unsqueeze(-1)
+      rev_mask = has_rev.unsqueeze(-1).type_as(e)
+      nb_sum = in_sum[src] - e[rev_idx] * rev_mask
+      nb_deg = (in_deg[src] - rev_mask).clamp(min=1.0)
+      nb_msg = nb_sum / nb_deg
+      edge_in = torch.cat([e, h_sum, h_diff, nb_msg], dim=-1)
+    else:
+      edge_in = torch.cat([e, h_sum, h_diff], dim=-1)
+
+    e_upd = self.edge_updaters[layer_idx](edge_in)
+    edge_norm = self.edge_norms[layer_idx]
+    if isinstance(edge_norm, GraphNorm):
+      edge_batch = batch[src] if batch is not None else None
+      e_upd = edge_norm(e_upd, edge_batch)
+    else:
+      e_upd = edge_norm(e_upd)
+    e_upd = F.relu(e_upd)
+    if layer_idx < self.num_layers - 1 and self.gnn_dropout > 0.0:
+      e_upd = F.dropout(e_upd, p=self.gnn_dropout, training=self.training)
+    return e + e_upd
+
   def _encode_appearance(self, data, batch=None):
     if (
         self.app_feat_dim <= 0
@@ -506,7 +643,13 @@ class GraphEncoder(nn.Module):
     num_nodes = x_app.size(0)
 
     with torch.no_grad():
-      x_norm = F.normalize(x_app.detach(), p=2, dim=-1)
+      x_det = x_app.detach()
+      if self.use_center_norm and hasattr(self, "app_running_mean"):
+        active_n = x_det.abs().sum(dim=-1, keepdim=True) > 0
+        x_det = torch.where(
+            active_n, x_det - self.app_running_mean.squeeze(0), x_det
+        )
+      x_norm = F.normalize(x_det, p=2, dim=-1)
       vis_edge_cos = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
 
     h_norm = F.normalize(h, p=2, dim=-1)
@@ -549,7 +692,14 @@ class GraphEncoder(nn.Module):
     if self.use_app_edges and a is not None:
       edge_attr = edge_attr + self._compute_edge_appearance(a, edge_index)
 
+    rev_idx, has_rev = (
+        _build_rev_edge_index(edge_index, x.size(0))
+        if self.use_nb_relay
+        else (None, None)
+    )
+
     layer_outputs = []
+    edge_outputs = []
     for i, layer in enumerate(self.layers):
       x_in = x
       x = layer(x, edge_index, edge_attr=edge_attr)
@@ -564,6 +714,14 @@ class GraphEncoder(nn.Module):
         x = F.dropout(x, p=self.gnn_dropout, training=self.training)
 
       x = x + x_in
+
+      if self.use_edge_co_update and (
+          self.use_edge_readout or i < self.num_layers - 1
+      ):
+        edge_attr = self._update_edge_state(
+            edge_attr, x, edge_index, batch, i, rev_idx=rev_idx, has_rev=has_rev
+        )
+
       if self.use_full_app_prop and x_app is not None:
         x_app = self._propagate_full_appearance(
             x_app, x, edge_attr, edge_index, i
@@ -571,8 +729,20 @@ class GraphEncoder(nn.Module):
 
       if self.use_jk:
         layer_outputs.append(x)
+        if self.use_edge_readout:
+          edge_outputs.append(edge_attr)
 
     x_final = torch.cat(layer_outputs, dim=-1) if self.use_jk else x
+    if self.use_edge_readout:
+      e_final = torch.cat(edge_outputs, dim=-1) if self.use_jk else edge_attr
+      if edge_index.numel() > 0:
+        e_node = scatter(
+            e_final, edge_index[1], dim=0, dim_size=x_final.size(0), reduce="mean"
+        )
+      else:
+        e_node = torch.zeros_like(x_final)
+      x_final = torch.cat([x_final, e_node], dim=-1)
+
     x_final = self._center_gnn_nodes(x_final, batch)
     out = self._apply_pooling(x_final, batch)
 
@@ -633,8 +803,21 @@ class GraphEncoder(nn.Module):
       e1 = e1 + self._compute_edge_appearance(a1, edge_index1)
       e2 = e2 + self._compute_edge_appearance(a2, edge_index2)
 
+    rev_idx1, has_rev1 = (
+        _build_rev_edge_index(edge_index1, h1.size(0))
+        if self.use_nb_relay
+        else (None, None)
+    )
+    rev_idx2, has_rev2 = (
+        _build_rev_edge_index(edge_index2, h2.size(0))
+        if self.use_nb_relay
+        else (None, None)
+    )
+
     layer_outputs1 = []
     layer_outputs2 = []
+    edge_outputs1 = []
+    edge_outputs2 = []
 
     for i, layer in enumerate(self.layers):
       h1_in = h1
@@ -679,7 +862,17 @@ class GraphEncoder(nn.Module):
           torch.cat([h2, self.proj_match(mu2_seeds)], dim=-1)
       )
 
-      # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors (After GMN seed update!)
+      if self.use_edge_co_update and (
+          self.use_edge_readout or i < self.num_layers - 1
+      ):
+        e1 = self._update_edge_state(
+            e1, h1, edge_index1, batch1, i, rev_idx=rev_idx1, has_rev=has_rev1
+        )
+        e2 = self._update_edge_state(
+            e2, h2, edge_index2, batch2, i, rev_idx=rev_idx2, has_rev=has_rev2
+        )
+
+      # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors (After GMN seed & edge update!)
       if self.use_full_app_prop and x1_app is not None and x2_app is not None:
         x1_app = self._propagate_full_appearance(
             x1_app, h1, e1, edge_index1, i
@@ -691,9 +884,32 @@ class GraphEncoder(nn.Module):
       if self.use_jk:
         layer_outputs1.append(h1)
         layer_outputs2.append(h2)
+        if self.use_edge_readout:
+          edge_outputs1.append(e1)
+          edge_outputs2.append(e2)
 
     h1_final = torch.cat(layer_outputs1, dim=-1) if self.use_jk else h1
     h2_final = torch.cat(layer_outputs2, dim=-1) if self.use_jk else h2
+    if self.use_edge_readout:
+      e1_final = torch.cat(edge_outputs1, dim=-1) if self.use_jk else e1
+      e2_final = torch.cat(edge_outputs2, dim=-1) if self.use_jk else e2
+      e1_node = (
+          scatter(
+              e1_final, edge_index1[1], dim=0, dim_size=h1_final.size(0), reduce="mean"
+          )
+          if edge_index1.numel() > 0
+          else torch.zeros_like(h1_final)
+      )
+      e2_node = (
+          scatter(
+              e2_final, edge_index2[1], dim=0, dim_size=h2_final.size(0), reduce="mean"
+          )
+          if edge_index2.numel() > 0
+          else torch.zeros_like(h2_final)
+      )
+      h1_final = torch.cat([h1_final, e1_node], dim=-1)
+      h2_final = torch.cat([h2_final, e2_node], dim=-1)
+
     h1_final = self._center_gnn_nodes(h1_final, batch1)
     h2_final = self._center_gnn_nodes(h2_final, batch2)
 

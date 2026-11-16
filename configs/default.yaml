@@ -25,6 +25,7 @@ model:
   vision_checkpoint: "checkpoints/pretrained_resnet12/resnet12_deepemd_pretrain.pth"
   num_layers: 4
   graph_hidden_dim: 128
+  edge_prop_mode: "none"        # Temp sweep: 'none' | 'co_update' | 'gated_static' | 'gated_co_update' | 'nb_co_update' | 'nb_gated_co_update' | 'nb_gated_dual_jk'
   node_feat_dim: 11
   edge_feat_dim: 14
   gnn_dropout: 0.1              # Feature dropout inside intermediate GINE layers & app_input_mlp
