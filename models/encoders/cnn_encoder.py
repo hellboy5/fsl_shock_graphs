@@ -13,7 +13,6 @@ STAGE_CHANNELS = {1: 64, 2: 160, 3: 320, 4: 640}
 class VisionEncoder(nn.Module):
     def __init__(
         self,
-        proj_feat_dim=640,
         drop_rate=0.1,
         hc_layers=(1, 2, 3),
         hc_radius_mode='disk_5pt',
@@ -21,7 +20,6 @@ class VisionEncoder(nn.Module):
     ):
         """
         Args:
-            proj_feat_dim: Accepted for interface compatibility with multimodal_network
             drop_rate: Dropout rate for the ResNet-12 backbone
             hc_layers: Int (e.g. 3 -> [1,2,3]) or list of stage indices in {1,2,3,4}
             hc_radius_mode: 'none' | 'concat_r' | 'disk_5pt' | 'disk_9pt' | 'center_ring_concat'

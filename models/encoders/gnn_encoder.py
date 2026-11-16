@@ -253,7 +253,6 @@ class GraphEncoder(nn.Module):
       node_feat_dim=11,
       edge_feat_dim=14,
       hidden_dim=128,
-      proj_feat_dim=640,
       num_layers=4,
       gnn_dropout=0.1,
       norm_type="graph",
@@ -276,7 +275,6 @@ class GraphEncoder(nn.Module):
     self.use_jk = use_jk
     self.num_layers = num_layers
     self.hidden_dim = hidden_dim
-    self.proj_feat_dim = proj_feat_dim
     self.gnn_dropout = float(gnn_dropout)
     self.pooling_method = str(pooling_method).lower()
     self.scale = 1.0 / (hidden_dim**0.5)

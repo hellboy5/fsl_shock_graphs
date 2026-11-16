@@ -59,13 +59,11 @@ class GraphClassificationModel(nn.Module):
     super(GraphClassificationModel, self).__init__()
     num_classes = int(cfg.dataset.num_classes)
     g_hidden_dim = cfg.model.graph_hidden_dim
-    g_proj_dim = cfg.model.graph_proj_dim
 
     self.encoder = GraphEncoder(
         node_feat_dim=cfg.model.node_feat_dim,
         edge_feat_dim=cfg.model.edge_feat_dim,
         hidden_dim=g_hidden_dim,
-        proj_feat_dim=g_proj_dim,
         num_layers=cfg.model.num_layers,
         gnn_dropout=cfg.model.gnn_dropout,
         norm_type=cfg.model.norm_type,

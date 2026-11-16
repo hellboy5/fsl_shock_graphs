@@ -25,7 +25,6 @@ model:
   vision_checkpoint: "checkpoints/pretrained_resnet12/resnet12_deepemd_pretrain.pth"
   num_layers: 4
   graph_hidden_dim: 128
-  graph_proj_dim: 640
   node_feat_dim: 11
   edge_feat_dim: 14
   gnn_dropout: 0.1              # Feature dropout inside intermediate GINE layers & app_input_mlp
