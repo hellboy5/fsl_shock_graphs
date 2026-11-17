@@ -49,60 +49,6 @@ def _build_rev_edge_index(edge_index, num_nodes):
   return rev_idx, has_rev
 
 
-def compute_pairwise_seed_residuals(
-    h1_seeds,
-    h2_seeds,
-    batch1_seeds,
-    batch2_seeds,
-    N_query,
-    N_support,
-    scale,
-):
-  """Computes isolated pairwise cross-attention residuals strictly within each (q, s) pair."""
-  H_q, M_q = to_dense_batch(h1_seeds, batch1_seeds, batch_size=N_query)
-  H_s, M_s = to_dense_batch(h2_seeds, batch2_seeds, batch_size=N_support)
-
-  H_q_norm = F.normalize(H_q, p=2, dim=-1)
-  H_s_norm = F.normalize(H_s, p=2, dim=-1)
-
-  # Pairwise cosine similarity strictly between Query q and Support s: [N_q, N_s, K_q, K_s]
-  cos_sim = torch.einsum("qid, sjd -> qsij", H_q_norm, H_s_norm)
-
-  scores = cos_sim * 5.0
-
-  # 1. Query -> Support attention
-  scores_q2s = scores.masked_fill(~M_s.unsqueeze(0).unsqueeze(2), -1e9)
-  a12 = torch.nan_to_num(F.softmax(scores_q2s, dim=-1), nan=0.0)
-
-  q_counts = M_q.sum(dim=-1, keepdim=True).clamp(min=1.0)
-  pair_sim_q = (
-      ((cos_sim * a12).sum(dim=-1) * M_q.unsqueeze(1)).sum(dim=-1) / q_counts
-  )
-  w_q2s = F.softmax(pair_sim_q * 5.0, dim=-1)
-
-  a12_weighted = w_q2s.unsqueeze(-1).unsqueeze(-1) * a12
-  retrieved2 = torch.einsum("qsij, sjd -> qid", a12_weighted, H_s)
-  mu1_dense = H_q - retrieved2
-  mu1_seeds = mu1_dense[M_q]
-
-  # 2. Support -> Query attention
-  scores_s2q = scores.masked_fill(~M_q.unsqueeze(1).unsqueeze(3), -1e9)
-  a21 = torch.nan_to_num(F.softmax(scores_s2q, dim=-2), nan=0.0)
-
-  s_counts = M_s.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
-  pair_sim_s = (
-      ((cos_sim * a21).sum(dim=-2) * M_s.unsqueeze(0)).sum(dim=-1) / s_counts
-  )
-  w_s2q = F.softmax(pair_sim_s * 5.0, dim=0)
-
-  a21_weighted = w_s2q.unsqueeze(-1).unsqueeze(-1) * a21
-  retrieved1 = torch.einsum("qsij, qid -> sjd", a21_weighted, H_q)
-  mu2_dense = H_s - retrieved1
-  mu2_seeds = mu2_dense[M_s]
-
-  return mu1_seeds, mu2_seeds
-
-
 def compute_cross_transformer_reconstruction_distance(
     h1_final,
     h2_final,
@@ -289,7 +235,7 @@ def compute_cross_transformer_reconstruction_distance(
 
 
 class GraphEncoder(nn.Module):
-  """GINE & Graph Matching Network (GMN) Backbone with Modular & Direct Full-Vector Visual Fusion."""
+  """GINE Backbone with Dynamic Edge Propagation & Centered Set-to-Set Visual Fusion."""
 
   VALID_EDGE_MODES = (
       "none",
@@ -467,17 +413,7 @@ class GraphEncoder(nn.Module):
     self.register_buffer("gnn_running_mean", torch.zeros(1, self.out_dim))
     self.register_buffer("gnn_mean_init", torch.tensor(False))
 
-    # 5. GMN Cross-Graph Matching Heads
-    self.proj_match = nn.Linear(hidden_dim, hidden_dim)
-    self.node_update = nn.Sequential(
-        nn.Linear(hidden_dim * 2, hidden_dim),
-        nn.GELU(),
-        nn.Linear(hidden_dim, hidden_dim),
-    )
-    nn.init.zeros_(self.node_update[-1].weight)
-    nn.init.zeros_(self.node_update[-1].bias)
-
-    # 6. Visual Appearance Fusion Heads (All prefixed with `app_` for LR routing)
+    # 5. Visual Appearance Fusion Heads (All prefixed with `app_` for LR routing)
     needs_app_stem = (
         self.use_app_node_input
         or self.use_app_edges
@@ -845,23 +781,6 @@ class GraphEncoder(nn.Module):
       h1 = h1 + h1_in
       h2 = h2 + h2_in
 
-      mu1_seeds, mu2_seeds = compute_pairwise_seed_residuals(
-          h1,
-          h2,
-          batch1,
-          batch2,
-          N_query,
-          N_support,
-          self.scale,
-      )
-
-      h1 = h1 + self.node_update(
-          torch.cat([h1, self.proj_match(mu1_seeds)], dim=-1)
-      )
-      h2 = h2 + self.node_update(
-          torch.cat([h2, self.proj_match(mu2_seeds)], dim=-1)
-      )
-
       if self.use_edge_co_update and (
           self.use_edge_readout or i < self.num_layers - 1
       ):
@@ -872,7 +791,7 @@ class GraphEncoder(nn.Module):
             e2, h2, edge_index2, batch2, i, rev_idx=rev_idx2, has_rev=has_rev2
         )
 
-      # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors (After GMN seed & edge update!)
+      # Step 3: Coupled Multi-Hop Propagation of Full 1,120-D Vectors
       if self.use_full_app_prop and x1_app is not None and x2_app is not None:
         x1_app = self._propagate_full_appearance(
             x1_app, h1, e1, edge_index1, i

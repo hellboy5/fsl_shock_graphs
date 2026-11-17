@@ -166,13 +166,6 @@ def run_training(cfg, device):
   wd = float(cfg.training.weight_decay)
 
   if has_loaded_checkpoint and cfg.model.fsl_method == 'gmn':
-    # Re-zero final layer of node_update in case Stage 1 checkpoint saved random init weights
-    if hasattr(model, 'graph_encoder') and hasattr(
-        model.graph_encoder, 'node_update'
-    ):
-      torch.nn.init.zeros_(model.graph_encoder.node_update[-1].weight)
-      torch.nn.init.zeros_(model.graph_encoder.node_update[-1].bias)
-
     backbone_params = []
     matching_params = []
     vision_params = []
@@ -182,10 +175,7 @@ def run_training(cfg, device):
         continue
       if 'vision_encoder' in name:
         vision_params.append(param)
-      elif any(
-          k in name
-          for k in ('proj_match', 'node_update', 'app_')
-      ):
+      elif 'app_' in name:
         matching_params.append(param)
       else:
         backbone_params.append(param)
@@ -195,8 +185,11 @@ def run_training(cfg, device):
     v_lr = float(cfg.training.vision_lr)
     param_groups = [
         {'params': backbone_params, 'lr': b_lr, 'weight_decay': wd},
-        {'params': matching_params, 'lr': m_lr, 'weight_decay': wd},
     ]
+    if len(matching_params) > 0:
+      param_groups.append(
+          {'params': matching_params, 'lr': m_lr, 'weight_decay': wd}
+      )
     if len(vision_params) > 0:
       param_groups.append(
           {'params': vision_params, 'lr': v_lr, 'weight_decay': wd}
@@ -204,7 +197,8 @@ def run_training(cfg, device):
     optimizer = optim.AdamW(param_groups)
     print(
         '--> [Optimizer: Disentangled GMN AdamW] '
-        f'backbone_lr={b_lr}, matching_head_lr={m_lr}, vision_lr={v_lr} '
+        f'backbone_lr={b_lr}, matching_head_lr={m_lr} '
+        f'(matching_tensors={len(matching_params)}), vision_lr={v_lr} '
         f'(vision_tensors={len(vision_params)}), '
         f'weight_decay={wd} | Scheduler: CosineAnnealingLR'
     )
