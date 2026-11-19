@@ -63,6 +63,7 @@ def compute_cross_transformer_reconstruction_distance(
     use_center_norm=False,
     app_running_mean=None,
     return_gnn_dist=False,
+    use_global_dist=True,
 ):
   """Computes unpooled Bidirectional CrossTransformers Set-to-Set Keypoint Distance."""
   h1_seeds = h1_final
@@ -227,8 +228,13 @@ def compute_cross_transformer_reconstruction_distance(
   )
   local_recon_dist = 0.5 * (dist_q2s + dist_s2q)
 
-  mm_dist = 0.85 * local_recon_dist + 0.15 * global_dist
-  gnn_dist = 0.85 * local_gnn_dist + 0.15 * gnn_global_dist
+  if use_global_dist:
+    mm_dist = 0.85 * local_recon_dist + 0.15 * global_dist
+    gnn_dist = 0.85 * local_gnn_dist + 0.15 * gnn_global_dist
+  else:
+    mm_dist = local_recon_dist
+    gnn_dist = local_gnn_dist
+
   if return_gnn_dist:
     return mm_dist, gnn_dist
   return mm_dist
@@ -263,6 +269,8 @@ class GraphEncoder(nn.Module):
       use_reconstruction_dist=True,
       use_full_app_prop=False,
       use_center_norm=False,
+      center_vis_edge=True,
+      use_global_dist=True,
       app_feat_dim=0,
       app_mlp_dim=None,
       app_graph_dropout=0.35,
@@ -304,7 +312,15 @@ class GraphEncoder(nn.Module):
     self.scale = 1.0 / (hidden_dim**0.5)
     self.use_reconstruction_dist = use_reconstruction_dist
     self.use_center_norm = bool(use_center_norm)
+    self.center_vis_edge = bool(center_vis_edge)
+    self.use_global_dist = bool(use_global_dist)
     self.last_gnn_dist = None
+
+    print(
+        f"--> [GraphEncoder] edge_prop_mode={self.edge_prop_mode} | "
+        f"center_vis_edge={self.center_vis_edge} | "
+        f"use_global_dist={self.use_global_dist}"
+    )
 
     self.app_feat_dim = int(app_feat_dim)
     self.app_mlp_dim = (
@@ -580,7 +596,11 @@ class GraphEncoder(nn.Module):
 
     with torch.no_grad():
       x_det = x_app.detach()
-      if self.use_center_norm and hasattr(self, "app_running_mean"):
+      if (
+          self.center_vis_edge
+          and self.use_center_norm
+          and hasattr(self, "app_running_mean")
+      ):
         active_n = x_det.abs().sum(dim=-1, keepdim=True) > 0
         x_det = torch.where(
             active_n, x_det - self.app_running_mean.squeeze(0), x_det
@@ -850,6 +870,7 @@ class GraphEncoder(nn.Module):
           use_center_norm=self.use_center_norm,
           app_running_mean=getattr(self, "app_running_mean", None),
           return_gnn_dist=True,
+          use_global_dist=self.use_global_dist,
       )
       self.last_gnn_dist = gnn_dist
       return dist, None, None

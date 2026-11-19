@@ -87,6 +87,8 @@ class MultimodalFewShotNetwork(nn.Module):
           use_reconstruction_dist=cfg.model.use_reconstruction_dist,
           use_full_app_prop=cfg.model.use_full_app_prop,
           use_center_norm=cfg.model.use_center_norm,
+          center_vis_edge=cfg.model.center_vis_edge,
+          use_global_dist=cfg.model.use_global_dist,
           app_feat_dim=app_feat_dim,
           app_mlp_dim=cfg.model.app_mlp_dim,
           app_graph_dropout=cfg.model.app_graph_dropout,

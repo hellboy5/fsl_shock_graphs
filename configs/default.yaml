@@ -38,6 +38,8 @@ model:
   distance_metric: "cosine"     # Used when fsl_method == 'protonet'
   pretrain_cosine_scale: 10.0   # Stage 1 64-class cosine logit multiplier (scale * cos)
   gmn_dist_scale: 5.0           # Stage 2 GMN distance logit multiplier (-scale * dist)
+  center_vis_edge: true   	# Subtract app_running_mean before vis_edge_cos in FullProp
+  use_global_dist: true   	# True: 0.85*local + 0.15*global | False: 1.00*local_recon_dist
 
   # --- Visual Hypercolumn Extraction Settings ---
   hc_layers: [2, 3, 4]          # ResNet stages to concat (1,120-D)
