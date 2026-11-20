@@ -38,8 +38,8 @@ model:
   distance_metric: "cosine"     # Used when fsl_method == 'protonet'
   pretrain_cosine_scale: 10.0   # Stage 1 64-class cosine logit multiplier (scale * cos)
   gmn_dist_scale: 5.0           # Stage 2 GMN distance logit multiplier (-scale * dist)
-  center_vis_edge: true   	# Subtract app_running_mean before vis_edge_cos in FullProp
-  use_global_dist: true   	# True: 0.85*local + 0.15*global | False: 1.00*local_recon_dist
+  center_vis_edge: true         # Subtract app_running_mean before vis_edge_cos in FullProp
+  use_global_dist: true         # True: 0.85*local + 0.15*global | False: 1.00*local_recon_dist
   use_edge_matching: false      # GlueStick-style orientation-invariant branch matching head
   edge_match_vis_mode: "both"   # Multimodal edge visual mode: 'none' | 'endpoint' | 'both'
   edge_match_diff_gamma: 0.25   # Weight on directed appearance difference (v_v - v_u) in S_edge
