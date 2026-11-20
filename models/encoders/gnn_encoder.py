@@ -240,6 +240,129 @@ def compute_cross_transformer_reconstruction_distance(
   return mm_dist
 
 
+def compute_gluestick_edge_reconstruction_distance(
+    e1_final,
+    e2_final,
+    edge_index1,
+    edge_index2,
+    batch1,
+    batch2,
+    N_query,
+    N_support,
+    x1_app=None,
+    x2_app=None,
+    use_center_norm=False,
+    app_running_mean=None,
+    edge_match_vis_logit=None,
+    edge_match_vis_mode="both",
+    edge_match_diff_gamma=0.25,
+):
+  """GlueStick-style orientation-invariant bidirectional branch reconstruction."""
+  device = e1_final.device
+  if edge_index1.numel() == 0 or edge_index2.numel() == 0:
+    zero = torch.zeros(N_query, N_support, device=device, dtype=e1_final.dtype)
+    return zero, zero
+
+  # converter.py emits consecutive (2k: u->v, 2k+1: v->u) pairs per physical branch
+  e1_fwd, e1_rev = F.normalize(e1_final[0::2], p=2, dim=-1), F.normalize(e1_final[1::2], p=2, dim=-1)
+  e2_fwd, e2_rev = F.normalize(e2_final[0::2], p=2, dim=-1), F.normalize(e2_final[1::2], p=2, dim=-1)
+  src1, dst1 = edge_index1[0, 0::2], edge_index1[1, 0::2]
+  src2, dst2 = edge_index2[0, 0::2], edge_index2[1, 0::2]
+  eb1 = batch1[src1]
+  eb2 = batch2[src2]
+
+  E1_f, M_eq = to_dense_batch(e1_fwd, eb1, batch_size=N_query)
+  E1_r, _ = to_dense_batch(e1_rev, eb1, batch_size=N_query)
+  E2_f, M_es = to_dense_batch(e2_fwd, eb2, batch_size=N_support)
+  E2_r, _ = to_dense_batch(e2_rev, eb2, batch_size=N_support)
+
+  s_geo_aligned = 0.5 * (
+      torch.einsum("qid, sjd -> qsij", E1_f, E2_f)
+      + torch.einsum("qid, sjd -> qsij", E1_r, E2_r)
+  )
+  s_geo_flipped = 0.5 * (
+      torch.einsum("qid, sjd -> qsij", E1_f, E2_r)
+      + torch.einsum("qid, sjd -> qsij", E1_r, E2_f)
+  )
+  s_edge_geo = torch.maximum(s_geo_aligned, s_geo_flipped)
+
+  use_vis = (
+      edge_match_vis_logit is not None
+      and x1_app is not None
+      and x2_app is not None
+      and edge_match_vis_mode != "none"
+  )
+  if use_vis:
+    with torch.no_grad():
+      q_act = scatter(x1_app.detach().abs().sum(dim=-1), batch1, dim=0, dim_size=N_query, reduce="sum") > 0
+      s_act = scatter(x2_app.detach().abs().sum(dim=-1), batch2, dim=0, dim_size=N_support, reduce="sum") > 0
+      pair_active = (q_act.unsqueeze(1) & s_act.unsqueeze(0)).unsqueeze(-1).unsqueeze(-1)
+
+    if use_center_norm and app_running_mean is not None:
+      mu = app_running_mean.squeeze(0)
+      x1_n = F.normalize(x1_app - mu, p=2, dim=-1)
+      x2_n = F.normalize(x2_app - mu, p=2, dim=-1)
+    else:
+      x1_n = F.normalize(x1_app, p=2, dim=-1)
+      x2_n = F.normalize(x2_app, p=2, dim=-1)
+
+    V1_u, _ = to_dense_batch(x1_n[src1], eb1, batch_size=N_query)
+    V1_v, _ = to_dense_batch(x1_n[dst1], eb1, batch_size=N_query)
+    V2_u, _ = to_dense_batch(x2_n[src2], eb2, batch_size=N_support)
+    V2_v, _ = to_dense_batch(x2_n[dst2], eb2, batch_size=N_support)
+
+    s_end_aligned = 0.5 * (
+        torch.einsum("qid, sjd -> qsij", V1_u, V2_u)
+        + torch.einsum("qid, sjd -> qsij", V1_v, V2_v)
+    )
+    s_end_flipped = 0.5 * (
+        torch.einsum("qid, sjd -> qsij", V1_u, V2_v)
+        + torch.einsum("qid, sjd -> qsij", V1_v, V2_u)
+    )
+    if edge_match_vis_mode == "both":
+      gamma = float(edge_match_diff_gamma)
+      s_vis_aligned = s_end_aligned + gamma * (s_end_aligned - s_end_flipped)
+      s_vis_flipped = s_end_flipped + gamma * (s_end_flipped - s_end_aligned)
+    else:
+      s_vis_aligned = s_end_aligned
+      s_vis_flipped = s_end_flipped
+
+    w_ev = torch.sigmoid(edge_match_vis_logit)
+    s_aligned = torch.where(
+        pair_active, w_ev * s_vis_aligned + (1.0 - w_ev) * s_geo_aligned, s_geo_aligned
+    )
+    s_flipped = torch.where(
+        pair_active, w_ev * s_vis_flipped + (1.0 - w_ev) * s_geo_flipped, s_geo_flipped
+    )
+    s_edge = torch.maximum(s_aligned, s_flipped)
+  else:
+    s_edge = s_edge_geo
+
+  K_eq = M_eq.sum(dim=-1, keepdim=True).clamp(min=1.0)
+  K_es = M_es.sum(dim=-1, keepdim=True).t().clamp(min=1.0)
+
+  def _bidir_recon(sim_mat):
+    scores = sim_mat * 10.0
+    A_q2s = torch.nan_to_num(
+        F.softmax(scores.masked_fill(~M_es.unsqueeze(0).unsqueeze(2), -1e9), dim=-1),
+        nan=0.0,
+    )
+    err_q = (2.0 - 2.0 * (A_q2s * sim_mat).sum(dim=-1)).masked_fill(~M_eq.unsqueeze(1), 0.0)
+    d_q2s = err_q.sum(dim=-1) / K_eq
+
+    A_s2q = torch.nan_to_num(
+        F.softmax(scores.masked_fill(~M_eq.unsqueeze(1).unsqueeze(3), -1e9), dim=-2),
+        nan=0.0,
+    )
+    err_s = (2.0 - 2.0 * (A_s2q * sim_mat).sum(dim=-2)).masked_fill(~M_es.unsqueeze(0), 0.0)
+    d_s2q = err_s.sum(dim=-1) / K_es
+    return 0.5 * (d_q2s + d_s2q)
+
+  d_edge_geo = _bidir_recon(s_edge_geo)
+  d_edge = _bidir_recon(s_edge) if use_vis else d_edge_geo
+  return d_edge, d_edge_geo
+
+
 class GraphEncoder(nn.Module):
   """GINE Backbone with Dynamic Edge Propagation & Centered Set-to-Set Visual Fusion."""
 
@@ -271,6 +394,9 @@ class GraphEncoder(nn.Module):
       use_center_norm=False,
       center_vis_edge=True,
       use_global_dist=True,
+      use_edge_matching=False,
+      edge_match_vis_mode="both",
+      edge_match_diff_gamma=0.25,
       app_feat_dim=0,
       app_mlp_dim=None,
       app_graph_dropout=0.35,
@@ -314,12 +440,16 @@ class GraphEncoder(nn.Module):
     self.use_center_norm = bool(use_center_norm)
     self.center_vis_edge = bool(center_vis_edge)
     self.use_global_dist = bool(use_global_dist)
+    self.use_edge_matching = bool(use_edge_matching)
+    self.edge_match_vis_mode = str(edge_match_vis_mode).lower()
+    self.edge_match_diff_gamma = float(edge_match_diff_gamma)
     self.last_gnn_dist = None
 
     print(
         f"--> [GraphEncoder] edge_prop_mode={self.edge_prop_mode} | "
         f"center_vis_edge={self.center_vis_edge} | "
-        f"use_global_dist={self.use_global_dist}"
+        f"use_global_dist={self.use_global_dist} | "
+        f"use_edge_matching={self.use_edge_matching}"
     )
 
     self.app_feat_dim = int(app_feat_dim)
@@ -429,6 +559,13 @@ class GraphEncoder(nn.Module):
     self.register_buffer("gnn_running_mean", torch.zeros(1, self.out_dim))
     self.register_buffer("gnn_mean_init", torch.tensor(False))
 
+    if self.use_edge_matching:
+      self.register_buffer("edge_running_mean", torch.zeros(1, hidden_dim))
+      self.register_buffer("edge_mean_init", torch.tensor(False))
+      self.edge_match_beta_logit = nn.Parameter(torch.tensor(-1.7346))
+      if self.use_app_recon_fusion:
+        self.edge_match_vis_logit = nn.Parameter(torch.tensor(0.0))
+
     # 5. Visual Appearance Fusion Heads (All prefixed with `app_` for LR routing)
     needs_app_stem = (
         self.use_app_node_input
@@ -503,6 +640,18 @@ class GraphEncoder(nn.Module):
         else:
           self.gnn_running_mean.lerp_(b_mean, 0.05)
     return h_nodes - self.gnn_running_mean
+
+  def _center_gnn_edges(self, e_edges, edge_batch):
+    if self.training and edge_batch is not None and e_edges.numel() > 0:
+      with torch.no_grad():
+        g_means = global_mean_pool(e_edges.detach(), edge_batch)
+        b_mean = g_means.mean(dim=0, keepdim=True)
+        if not bool(self.edge_mean_init.item()):
+          self.edge_running_mean.copy_(b_mean)
+          self.edge_mean_init.fill_(True)
+        else:
+          self.edge_running_mean.lerp_(b_mean, 0.05)
+    return e_edges - self.edge_running_mean
 
   def _update_edge_state(
       self, e, x, edge_index, batch, layer_idx, rev_idx=None, has_rev=None
@@ -872,6 +1021,37 @@ class GraphEncoder(nn.Module):
           return_gnn_dist=True,
           use_global_dist=self.use_global_dist,
       )
+      if self.use_edge_matching:
+        e1_c = (
+            self._center_gnn_edges(e1, batch1[edge_index1[0]])
+            if edge_index1.numel() > 0
+            else e1
+        )
+        e2_c = (
+            self._center_gnn_edges(e2, batch2[edge_index2[0]])
+            if edge_index2.numel() > 0
+            else e2
+        )
+        d_edge, d_edge_geo = compute_gluestick_edge_reconstruction_distance(
+            e1_final=e1_c,
+            e2_final=e2_c,
+            edge_index1=edge_index1,
+            edge_index2=edge_index2,
+            batch1=batch1,
+            batch2=batch2,
+            N_query=N_query,
+            N_support=N_support,
+            x1_app=x1_app if self.use_app_recon_fusion else None,
+            x2_app=x2_app if self.use_app_recon_fusion else None,
+            use_center_norm=self.use_center_norm,
+            app_running_mean=getattr(self, "app_running_mean", None),
+            edge_match_vis_logit=getattr(self, "edge_match_vis_logit", None),
+            edge_match_vis_mode=self.edge_match_vis_mode,
+            edge_match_diff_gamma=self.edge_match_diff_gamma,
+        )
+        beta = torch.sigmoid(self.edge_match_beta_logit)
+        dist = (1.0 - beta) * dist + beta * d_edge
+        gnn_dist = (1.0 - beta) * gnn_dist + beta * d_edge_geo
       self.last_gnn_dist = gnn_dist
       return dist, None, None
     else:

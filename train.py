@@ -175,7 +175,7 @@ def run_training(cfg, device):
         continue
       if 'vision_encoder' in name:
         vision_params.append(param)
-      elif 'app_' in name:
+      elif 'app_' in name or 'edge_match_' in name:
         matching_params.append(param)
       else:
         backbone_params.append(param)
